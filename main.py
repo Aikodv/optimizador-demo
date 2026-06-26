@@ -1,8 +1,11 @@
+from fastapi import FastAPI, HTTPException
 import math
 import requests
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
+
+app = FastAPI(title="Optimizador API (Sprint 1)")
 API_URL = "https://api-dummy-yurf.onrender.com/api"
 
 def obtener_datos():
