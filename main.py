@@ -1,14 +1,31 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 import math
-import requests
 import json
 import unicodedata
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
 # =============================================================================
-# 1. FUNCIONES AUXILIARES
+# 1. MODELOS DE DATOS (Lo que el POST espera recibir)
+# =============================================================================
+class TecnicoInput(BaseModel):
+    id: int
+    nombre: str
+    zona: str
+
+class OrdenInput(BaseModel):
+    id: str  # Puede ser string ("OT-001") o int, adáptalo si es necesario
+    direccion_instalacion: str
+
+class PayloadOptimizacion(BaseModel):
+    tecnicos: List[TecnicoInput]
+    ordenes: List[OrdenInput]
+
+# =============================================================================
+# 2. FUNCIONES AUXILIARES
 # =============================================================================
 def normalizar_texto(texto):
     if not texto: return ""
@@ -27,7 +44,7 @@ def cargar_coordenadas_comunas():
             if nombre and lat is not None and lon is not None:
                 comunas_dict[nombre] = (float(lat), float(lon))
     except FileNotFoundError:
-        pass
+        print("CUIDADO: Archivo 'Latitud - Longitud Chile.json' no encontrado.")
     return comunas_dict
 
 def calcular_distancia_km(coord1, coord2):
@@ -41,65 +58,61 @@ def calcular_distancia_km(coord1, coord2):
     return int(R * c)
 
 # =============================================================================
-# 2. CONFIGURACIÓN API
+# 3. CONFIGURACIÓN API
 # =============================================================================
-app = FastAPI(title="Optimizador API (Sprint 1)")
+app = FastAPI(title="Optimizador API (Sprint 1 - POST)")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],       
     allow_credentials=True,
-    allow_methods=["GET"],     
+    allow_methods=["GET", "POST"], # Agregamos POST aquí    
     allow_headers=["*"],       
 )
 
-API_URL = "https://api-dummy-yurf.onrender.com/api"
 DICCIONARIO_COMUNAS = cargar_coordenadas_comunas()
 
 @app.get("/")
 def inicio():
-    return {"mensaje": "¡La API está activa! Ve a /docs para probarla."}
+    return {"mensaje": "¡La API POST está activa! Envía tus datos a /api/v1/optimizar"}
 
 # =============================================================================
-# 3. ENDPOINT PRINCIPAL
+# 4. ENDPOINT PRINCIPAL (Ahora es un POST)
 # =============================================================================
-@app.get("/api/v1/optimizar")
-def optimizar_rutas():
-    try:
-        res_tec = requests.get(f"{API_URL}/tecnicos", timeout=15).json()
-        res_ot = requests.get(f"{API_URL}/ordenes?estado=por_asignar", timeout=15).json()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Error conectando a la API: {str(e)}")
-
-    # Ya no limitamos a 3 técnicos, usamos todos los disponibles
+@app.post("/api/v1/optimizar")
+def optimizar_rutas(payload: PayloadOptimizacion):
+    """
+    Recibe un JSON con técnicos y órdenes, calcula las rutas y devuelve la sugerencia.
+    """
+    # --- Asignar Coordenadas a Técnicos usando los datos del POST ---
     tecnicos = []
-    for t in res_tec: 
-        zona = normalizar_texto(t.get("zona", ""))
+    for t in payload.tecnicos: 
+        zona = normalizar_texto(t.zona)
         if zona in DICCIONARIO_COMUNAS:
             tecnicos.append({
-                "id": t["id"], 
-                "nombre": t["nombre"], 
+                "id": t.id, 
+                "nombre": t.nombre, 
                 "cap_max": 5, 
                 "coords": DICCIONARIO_COMUNAS[zona]
             })
 
-    # Ya no limitamos a 10 OTs, usamos todas las pendientes
+    # --- Asignar Coordenadas a OTs usando los datos del POST ---
     ordenes = []
-    for ot in res_ot: 
-        direccion = normalizar_texto(ot.get("direccion_instalacion", ""))
+    for ot in payload.ordenes: 
+        direccion = normalizar_texto(ot.direccion_instalacion)
         coords_ot = None
         for comuna, c_coords in DICCIONARIO_COMUNAS.items():
             if comuna in direccion:
                 coords_ot = c_coords
                 break
         if coords_ot:
-            ordenes.append({"id": ot["id"], "coords": coords_ot})
+            ordenes.append({"id": ot.id, "coords": coords_ot})
 
     if not tecnicos:
-        return {"mensaje": "Ningún técnico pudo ser mapeado."}
+        return {"mensaje": "Ningún técnico del payload pudo ser mapeado."}
     
     if not ordenes:
-        return {"estado": "exito", "asignaciones": [], "mensaje": "No hay órdenes pendientes mapeables."}
+        return {"estado": "exito", "asignaciones": [], "mensaje": "No hay órdenes mapeables en el payload."}
 
     # --- Motor OR-Tools ---
     nodos = [t["coords"] for t in tecnicos] + [ot["coords"] for ot in ordenes]
@@ -110,16 +123,13 @@ def optimizar_rutas():
     manager = pywrapcp.RoutingIndexManager(len(nodos), num_v, list(range(num_v)), list(range(num_v)))
     routing = pywrapcp.RoutingModel(manager)
 
-    # 1. Función de Costo (Distancia)
     idx_dist = routing.RegisterTransitCallback(lambda f, t: matriz[manager.IndexToNode(f)][manager.IndexToNode(t)])
     routing.SetArcCostEvaluatorOfVehicle(idx_dist, 0)
 
-    # 2. Dimensión de Capacidad (Max 5 OTs)
     demanda = [0] * num_v + [1] * len(ordenes)
     idx_cap = routing.RegisterUnaryTransitCallback(lambda f: demanda[manager.IndexToNode(f)])
     routing.AddDimensionWithVehicleCapacity(idx_cap, 0, [t["cap_max"] for t in tecnicos], True, 'Capacidad')
 
-    # 3. ¡NUEVO! Límite geográfico estricto: Máximo 100 km de recorrido total por técnico
     distancia_maxima_km = 100 
     routing.AddDimension(
         idx_dist,
@@ -129,11 +139,9 @@ def optimizar_rutas():
         'Distancia'
     )
 
-    # Nodos opcionales (Multa alta para que asigne lo más posible dentro del radio de 100km)
     for i in range(num_v, len(nodos)):
         routing.AddDisjunction([manager.NodeToIndex(i)], 100000)
 
-    # Parámetros de búsqueda con límite de tiempo de 3 segundos para no saturar Render
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     params.time_limit.FromSeconds(3) 
