@@ -2,58 +2,108 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import math
 import requests
+import json
+import unicodedata
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
-# 1. Definición de la aplicación
+# =============================================================================
+# 1. FUNCIONES AUXILIARES (Texto y Geometría)
+# =============================================================================
+def normalizar_texto(texto):
+    """Elimina tildes, mayúsculas y espacios extra para poder cruzar los datos."""
+    if not texto: return ""
+    texto = str(texto).strip().lower()
+    return ''.join((c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn'))
+
+def cargar_coordenadas_comunas():
+    """Carga el JSON local de comunas y retorna un diccionario {comuna: (lat, lon)}."""
+    comunas_dict = {}
+    try:
+        with open("Latitud - Longitud Chile.json", "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        for item in datos:
+            nombre = normalizar_texto(item.get("Comuna", ""))
+            lat = item.get("Latitud (Decimal)")
+            lon = item.get("Longitud (decimal)") or item.get("Longitud (Decimal)")
+            if nombre and lat is not None and lon is not None:
+                comunas_dict[nombre] = (float(lat), float(lon))
+    except FileNotFoundError:
+        print("CUIDADO: Archivo 'Latitud - Longitud Chile.json' no encontrado.")
+    return comunas_dict
+
+def calcular_distancia_km(coord1, coord2):
+    """Calcula la distancia real en kilómetros entre dos coordenadas Lat/Lon."""
+    lat1, lon1 = coord1
+    lat2, lon2 = coord2
+    R = 6371  # Radio de la Tierra en km
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return int(R * c)  # OR-Tools necesita números enteros
+
+# =============================================================================
+# 2. CONFIGURACIÓN DE LA API
+# =============================================================================
 app = FastAPI(title="Optimizador API (Sprint 1)")
 
-# --- CONFIGURACIÓN DE CORS ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # Permite peticiones desde cualquier dominio (ideal para desarrollo)
+    allow_origins=["*"],       
     allow_credentials=True,
-    allow_methods=["GET"],     # Solo permitimos peticiones GET por seguridad
-    allow_headers=["*"],       # Permite todos los headers
+    allow_methods=["GET"],     
+    allow_headers=["*"],       
 )
-# -----------------------------
 
 API_URL = "https://api-dummy-yurf.onrender.com/api"
+DICCIONARIO_COMUNAS = cargar_coordenadas_comunas()
 
-# 2. Ruta raíz (Para que el enlace principal de Render no muestre error)
 @app.get("/")
 def inicio():
     return {"mensaje": "¡La API está activa! Ve a /docs para probarla."}
 
-# 3. El Endpoint de optimización
+# =============================================================================
+# 3. ENDPOINT PRINCIPAL
+# =============================================================================
 @app.get("/api/v1/optimizar")
 def optimizar_rutas():
-    """
-    Endpoint que descarga los datos, calcula las rutas óptimas 
-    y devuelve la asignación en formato JSON.
-    """
-    # --- Descarga de Datos ---
     try:
         res_tec = requests.get(f"{API_URL}/tecnicos", timeout=10).json()
-        tecnicos = [{"id": t["id"], "nombre": t["nombre"], "cap_max": 5, "coords": (0, i * 20)} 
-                    for i, t in enumerate(res_tec[:3])]
-
         res_ot = requests.get(f"{API_URL}/ordenes?estado=por_asignar", timeout=10).json()
-        ordenes = [{"id": ot["id"], "coords": (50, i * 10)} 
-                   for i, ot in enumerate(res_ot[:10])]
-                   
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error conectando a la API: {str(e)}")
+
+    # --- Asignar Coordenadas Reales a Técnicos ---
+    tecnicos = []
+    for t in res_tec[:3]: # (Tomamos 3 para el MVP rápido)
+        zona = normalizar_texto(t.get("zona", ""))
+        coords = DICCIONARIO_COMUNAS.get(zona, (-33.4489, -70.6693)) # Santiago Centro por defecto
+        tecnicos.append({"id": t["id"], "nombre": t["nombre"], "cap_max": 5, "coords": coords})
+
+    # --- Asignar Coordenadas Reales a OTs ---
+    ordenes = []
+    for ot in res_ot[:10]: # (Tomamos 10 para el MVP rápido)
+        direccion = normalizar_texto(ot.get("direccion_instalacion", ""))
+        coords_ot = (-33.4489, -70.6693) # Santiago Centro por defecto
+        
+        # Buscamos si el nombre de alguna comuna del JSON está en la dirección de la OT
+        for comuna, c_coords in DICCIONARIO_COMUNAS.items():
+            if comuna in direccion:
+                coords_ot = c_coords
+                break
+                
+        ordenes.append({"id": ot["id"], "coords": coords_ot})
 
     if not tecnicos or not ordenes:
         return {"mensaje": "No hay suficientes datos para optimizar."}
 
-    # --- Lógica del Motor OR-Tools ---
+    # --- Motor OR-Tools ---
     nodos = [t["coords"] for t in tecnicos] + [ot["coords"] for ot in ordenes]
     num_v = len(tecnicos)
     
-    # Matriz de distancias
-    matriz = [[int(math.hypot(p1[0]-p2[0], p1[1]-p2[1])) for p2 in nodos] for p1 in nodos]
+    # Matriz usando la fórmula de kilómetros
+    matriz = [[calcular_distancia_km(nodos[i], nodos[j]) for j in range(len(nodos))] for i in range(len(nodos))]
 
     manager = pywrapcp.RoutingIndexManager(len(nodos), num_v, list(range(num_v)), list(range(num_v)))
     routing = pywrapcp.RoutingModel(manager)
@@ -66,7 +116,7 @@ def optimizar_rutas():
     routing.AddDimensionWithVehicleCapacity(idx_cap, 0, [t["cap_max"] for t in tecnicos], True, 'Capacidad')
 
     for i in range(num_v, len(nodos)):
-        routing.AddDisjunction([manager.NodeToIndex(i)], 10000)
+        routing.AddDisjunction([manager.NodeToIndex(i)], 100000)
 
     params = pywrapcp.DefaultRoutingSearchParameters()
     params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -75,7 +125,7 @@ def optimizar_rutas():
     if not solucion:
         raise HTTPException(status_code=422, detail="No se encontró solución factible")
 
-    # --- Construcción del JSON de respuesta ---
+    # --- JSON de Respuesta ---
     resultado = []
     for v in range(num_v):
         ruta = []
@@ -92,7 +142,6 @@ def optimizar_rutas():
             "ordenes_asignadas": ruta
         })
 
-    # Retornamos los datos directamente
     return {
         "estado": "exito",
         "total_tecnicos": len(tecnicos),
