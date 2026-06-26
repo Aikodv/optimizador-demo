@@ -130,7 +130,7 @@ def optimizar_rutas(payload: PayloadOptimizacion):
     idx_cap = routing.RegisterUnaryTransitCallback(lambda f: demanda[manager.IndexToNode(f)])
     routing.AddDimensionWithVehicleCapacity(idx_cap, 0, [t["cap_max"] for t in tecnicos], True, 'Capacidad')
 
-    distancia_maxima_km = 100 
+    distancia_maxima_km = 250 
     routing.AddDimension(
         idx_dist,
         0,  
