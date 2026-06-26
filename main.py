@@ -7,7 +7,12 @@ from ortools.constraint_solver import pywrapcp
 # 1. Definición de la aplicación
 app = FastAPI(title="Optimizador API (Sprint 1)")
 API_URL = "https://api-dummy-yurf.onrender.com/api"
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[""],       
+    allow_methods=["GET"],     # el único endpoint que exponen es GET /api/v1/optimizar
+    allow_headers=[""],
+)
 # 2. Ruta raíz (Para que el enlace principal de Render no muestre error)
 @app.get("/")
 def inicio():
