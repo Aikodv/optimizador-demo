@@ -74,29 +74,47 @@ def optimizar_rutas():
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Error conectando a la API: {str(e)}")
 
-    # --- Asignar Coordenadas Reales a Técnicos ---
+    # --- Asignar Coordenadas a Técnicos (ESTRICTO AL JSON) ---
     tecnicos = []
     for t in res_tec[:3]: # (Tomamos 3 para el MVP rápido)
         zona = normalizar_texto(t.get("zona", ""))
-        coords = DICCIONARIO_COMUNAS.get(zona, (-33.4489, -70.6693)) # Santiago Centro por defecto
-        tecnicos.append({"id": t["id"], "nombre": t["nombre"], "cap_max": 5, "coords": coords})
+        # Solo se agrega si la zona existe exactamente en el JSON
+        if zona in DICCIONARIO_COMUNAS:
+            tecnicos.append({
+                "id": t["id"], 
+                "nombre": t["nombre"], 
+                "cap_max": 5, 
+                "coords": DICCIONARIO_COMUNAS[zona]
+            })
 
-    # --- Asignar Coordenadas Reales a OTs ---
+    # --- Asignar Coordenadas a OTs (ESTRICTO AL JSON) ---
     ordenes = []
     for ot in res_ot[:10]: # (Tomamos 10 para el MVP rápido)
         direccion = normalizar_texto(ot.get("direccion_instalacion", ""))
-        coords_ot = (-33.4489, -70.6693) # Santiago Centro por defecto
+        coords_ot = None
         
-        # Buscamos si el nombre de alguna comuna del JSON está en la dirección de la OT
+        # Buscamos si el nombre de alguna comuna del JSON está en la dirección
         for comuna, c_coords in DICCIONARIO_COMUNAS.items():
             if comuna in direccion:
                 coords_ot = c_coords
                 break
                 
-        ordenes.append({"id": ot["id"], "coords": coords_ot})
+        # Solo se agrega si se encontró una coincidencia en el JSON
+        if coords_ot:
+            ordenes.append({"id": ot["id"], "coords": coords_ot})
 
-    if not tecnicos or not ordenes:
-        return {"mensaje": "No hay suficientes datos para optimizar."}
+    # --- Validaciones de Seguridad ---
+    if not tecnicos:
+        return {"mensaje": "Ningún técnico pudo ser mapeado con las coordenadas del JSON."}
+    
+    if not ordenes:
+        return {
+            "estado": "exito",
+            "total_tecnicos": len(tecnicos),
+            "total_ordenes_procesadas": 0,
+            "asignaciones": [{"tecnico_id": t["id"], "tecnico_nombre": t["nombre"], "ordenes_asignadas": []} for t in tecnicos],
+            "mensaje": "Ninguna orden pudo ser mapeada con el JSON, o no hay órdenes pendientes."
+        }
 
     # --- Motor OR-Tools ---
     nodos = [t["coords"] for t in tecnicos] + [ot["coords"] for ot in ordenes]
