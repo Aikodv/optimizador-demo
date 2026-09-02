@@ -1,0 +1,1165 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Optimizador de Rutas VRP - Despacho Inteligente Chile</title>
+  
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#f0f9ff',
+              500: '#0ea5e9',
+              600: '#0284c7',
+              700: '#0369a1',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  
+  <style>
+    /* Custom Scrollbars */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    
+    .tech-marker {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      color: white;
+      font-weight: bold;
+      font-size: 11px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.5);
+      border: 2px solid white;
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans min-h-screen flex flex-col antialiased">
+
+  <!-- Header / Navigation Bar -->
+  <header class="bg-slate-900 border-b border-slate-800 px-6 py-3.5 sticky top-0 z-30 flex flex-wrap items-center justify-between gap-4 shadow-lg">
+    <div class="flex items-center space-x-3">
+      <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-sky-600 to-indigo-600 flex items-center justify-center shadow-md shadow-sky-500/20 text-white font-bold text-lg">
+        <i class="fa-solid fa-route"></i>
+      </div>
+      <div>
+        <h1 class="text-lg font-bold text-white flex items-center gap-2">
+          Optimizador VRP Chile
+          <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-sky-500/20 text-sky-400 border border-sky-500/30">v2.1 Google OR-Tools</span>
+        </h1>
+        <p class="text-xs text-slate-400">Backoffice, Despacho y Ruteo Dinámico de Técnicos</p>
+      </div>
+    </div>
+
+    <!-- Quick Action Controls -->
+    <div class="flex items-center flex-wrap gap-2.5">
+      <button onclick="abrirModalConfiguracion()" class="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-2 transition-all hover:border-slate-600" title="Ajustar parámetros del modelo">
+        <i class="fa-solid fa-sliders text-amber-400"></i>
+        <span>Parámetros VRP</span>
+      </button>
+
+      <button onclick="abrirModalSimulacion()" class="px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-2 transition-all hover:border-slate-600">
+        <i class="fa-solid fa-dice text-indigo-400"></i>
+        <span>Simular Datos</span>
+      </button>
+
+      <button id="btn-optimizar" onclick="ejecutarOptimizacion()" class="px-4 py-2 rounded-lg bg-gradient-to-r from-sky-500 to-indigo-600 hover:from-sky-600 hover:to-indigo-700 text-white text-xs font-bold flex items-center gap-2 shadow-md shadow-sky-500/25 transition-all hover:scale-[1.02]">
+        <i class="fa-solid fa-bolt"></i>
+        <span>Optimizar Rutas</span>
+      </button>
+
+      <a href="/docs" target="_blank" class="p-2 text-slate-400 hover:text-white text-sm" title="Ver Documentación Swagger">
+        <i class="fa-solid fa-book"></i>
+      </a>
+    </div>
+  </header>
+
+  <!-- KPI Banner Cards -->
+  <section class="bg-slate-900/60 border-b border-slate-800 px-6 py-3">
+    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+      
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-indigo-500/20 text-indigo-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-clipboard-list"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Total OTs</div>
+          <div id="kpi-total-ots" class="text-base font-extrabold text-white">--</div>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-circle-check"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Asignadas</div>
+          <div id="kpi-asignadas" class="text-base font-extrabold text-emerald-400">--</div>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-clock"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Pendientes</div>
+          <div id="kpi-pendientes" class="text-base font-extrabold text-amber-400">--</div>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-sky-500/20 text-sky-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-chart-pie"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Tasa Éxito</div>
+          <div id="kpi-tasa" class="text-base font-extrabold text-sky-400">--%</div>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-purple-500/20 text-purple-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-user-gear"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Técnicos Disp.</div>
+          <div id="kpi-tecnicos" class="text-base font-extrabold text-purple-400">--</div>
+        </div>
+      </div>
+
+      <div class="bg-slate-800/80 border border-slate-700/60 rounded-xl p-2.5 flex items-center space-x-3">
+        <div class="w-8 h-8 rounded-lg bg-pink-500/20 text-pink-400 flex items-center justify-center text-sm">
+          <i class="fa-solid fa-truck-fast"></i>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase font-bold text-slate-400">Con Ruta Activa</div>
+          <div id="kpi-activos" class="text-base font-extrabold text-pink-400">--</div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- Main Workspace: Split View (Side Panel + Interactive Map) -->
+  <main class="flex-1 flex flex-col md:flex-row overflow-hidden relative">
+    
+    <!-- Left Panel: Lists & Schedules (40% width on Desktop) -->
+    <section class="w-full md:w-[450px] lg:w-[480px] bg-slate-900 border-r border-slate-800 flex flex-col h-[50vh] md:h-auto z-10 shadow-xl">
+      
+      <!-- Panel Tabs -->
+      <div class="flex border-b border-slate-800 px-3 bg-slate-950/40 text-xs font-semibold">
+        <button onclick="cambiarTab('rutas')" id="tab-btn-rutas" class="tab-btn px-4 py-3 border-b-2 border-sky-500 text-sky-400 font-bold flex items-center gap-2">
+          <i class="fa-solid fa-map-location-dot"></i>
+          <span>Hojas de Ruta</span>
+        </button>
+        <button onclick="cambiarTab('ordenes')" id="tab-btn-ordenes" class="tab-btn px-4 py-3 border-b-2 border-transparent text-slate-400 hover:text-slate-200 flex items-center gap-2">
+          <i class="fa-solid fa-list-check"></i>
+          <span>Órdenes (OTs)</span>
+        </button>
+        <button onclick="cambiarTab('tecnicos')" id="tab-btn-tecnicos" class="tab-btn px-4 py-3 border-b-2 border-transparent text-slate-400 hover:text-slate-200 flex items-center gap-2">
+          <i class="fa-solid fa-users"></i>
+          <span>Técnicos</span>
+        </button>
+      </div>
+
+      <!-- Tab Content 1: Hojas de Ruta -->
+      <div id="tab-content-rutas" class="tab-panel flex-1 overflow-y-auto p-4 space-y-3.5">
+        <div id="contenedor-rutas" class="space-y-3">
+          <div class="text-center py-12 text-slate-500 text-sm">
+            <i class="fa-solid fa-route text-3xl mb-2 text-slate-600 block"></i>
+            Haz clic en <strong>"Optimizar Rutas"</strong> para calcular el cronograma del día.
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab Content 2: Lista de Órdenes de Trabajo -->
+      <div id="tab-content-ordenes" class="tab-panel hidden flex-1 overflow-y-auto p-4 space-y-3">
+        <div class="relative">
+          <input type="text" id="filtro-ots" oninput="filtrarOTs()" placeholder="Buscar por ID, comuna, cliente..." class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500">
+          <i class="fa-solid fa-magnifying-glass absolute right-3 top-2.5 text-slate-500 text-xs"></i>
+        </div>
+        <div id="contenedor-ordenes" class="space-y-2"></div>
+      </div>
+
+      <!-- Tab Content 3: Técnicos -->
+      <div id="tab-content-tecnicos" class="tab-panel hidden flex-1 overflow-y-auto p-4 space-y-3">
+        <div id="contenedor-tecnicos" class="space-y-2.5"></div>
+      </div>
+
+    </section>
+
+    <!-- Right Panel: Interactive Leaflet Map -->
+    <section class="flex-1 h-[50vh] md:h-auto relative bg-slate-950">
+      <div id="map" class="w-full h-full z-0"></div>
+
+      <!-- Floating Map Legend -->
+      <div class="absolute bottom-4 right-4 bg-slate-900/90 border border-slate-700 backdrop-blur-md rounded-xl p-3 shadow-2xl z-10 text-xs space-y-2 max-w-[240px]">
+        <div class="font-bold text-slate-200 flex items-center justify-between">
+          <span>Leyenda de Rutas</span>
+          <i class="fa-solid fa-layer-group text-slate-400"></i>
+        </div>
+        <div id="map-legend-items" class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+          <div class="text-slate-500 text-[11px]">Ejecuta la optimización para ver el ruteo.</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal para Configuración de Parámetros VRP -->
+  <div id="modal-configuracion" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+      
+      <!-- Modal Header -->
+      <div class="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-slate-900/90">
+        <div class="flex items-center space-x-2.5">
+          <div class="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-400 flex items-center justify-center text-sm">
+            <i class="fa-solid fa-sliders"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-bold text-white">Parámetros del Optimizador VRP</h3>
+            <p class="text-[11px] text-slate-400">Ajuste fino de tiempos de servicio, capacidades y penalizaciones</p>
+          </div>
+        </div>
+        <button onclick="cerrarModalConfiguracion()" class="text-slate-400 hover:text-white">
+          <i class="fa-solid fa-xmark text-base"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body (Formulario con Scroll) -->
+      <div class="p-6 overflow-y-auto space-y-6 text-xs flex-1">
+        
+        <!-- Grupo 1: Tiempos de Servicio por Tipo de Trabajo -->
+        <div class="space-y-3">
+          <h4 class="font-bold text-sky-400 flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
+            <i class="fa-solid fa-stopwatch"></i>
+            Tiempos de Servicio (Minutos por Tipo de OT)
+          </h4>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Instalación Simple</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-st-instalacion-simple" min="5" max="240" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Inst. con Corte</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-st-instalacion-corte" min="5" max="300" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Mantención</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-st-mantencion" min="5" max="240" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Retiro</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-st-retiro" min="5" max="180" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Grupo 2: Jornada Laboral y Capacidades -->
+        <div class="space-y-3">
+          <h4 class="font-bold text-indigo-400 flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
+            <i class="fa-solid fa-business-time"></i>
+            Jornada Laboral y Capacidades de Flota
+          </h4>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Inicio Jornada</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-inicio-jornada" min="6" max="12" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">:00 AM</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Duración Máx Jornada</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-fin-jornada" min="180" max="900" step="30" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Cap. Máx Internos</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-cap-interno" min="1" max="25" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">OTs</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Cap. Máx Externos</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-cap-externo" min="1" max="20" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">OTs</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Grupo 3: Geometría, Velocidad y Algoritmo OR-Tools -->
+        <div class="space-y-3">
+          <h4 class="font-bold text-emerald-400 flex items-center gap-1.5 uppercase tracking-wider text-[11px]">
+            <i class="fa-solid fa-microchip"></i>
+            Geometría y Parámetros del Solver
+          </h4>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Sinuosidad Vial</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-sinuosidad" min="1.0" max="2.5" step="0.05" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">x</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Velocidad Media</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-velocidad" min="10" max="90" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">km/h</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Límite Solver</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-solver-time" min="1" max="60" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">seg</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Balance de Flota</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-span-cost" min="0" max="300" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">span</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Grupo 4: Interruptores de Servicios Externos -->
+        <div class="bg-slate-950 p-4 rounded-xl border border-slate-800 flex items-center justify-between">
+          <div class="flex items-center space-x-3">
+            <input type="checkbox" id="cfg-usar-osrm" class="w-4 h-4 rounded accent-sky-500 cursor-pointer">
+            <div>
+              <label for="cfg-usar-osrm" class="font-bold text-slate-200 cursor-pointer">Usar Servidor OSRM para Rutas Reales</label>
+              <p class="text-[10px] text-slate-500">Consulta la matriz de tiempos de tráfico por carretera (desactiva para usar Haversine puro).</p>
+            </div>
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="px-6 py-3.5 border-t border-slate-800 bg-slate-900/90 flex items-center justify-between">
+        <button onclick="restaurarConfiguracion()" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center gap-1.5 border border-slate-700">
+          <i class="fa-solid fa-rotate-left text-amber-400"></i>
+          <span>Restaurar Valores por Defecto</span>
+        </button>
+
+        <div class="flex items-center gap-2">
+          <button onclick="cerrarModalConfiguracion()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold">
+            Cancelar
+          </button>
+          <button onclick="guardarConfiguracion()" class="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold flex items-center gap-1.5 shadow-md shadow-sky-500/20">
+            <i class="fa-solid fa-floppy-disk"></i>
+            <span>Guardar Parámetros</span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Modal para Simulación Dinámica de Datos -->
+  <div id="modal-simulacion" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl p-6 max-w-md w-full shadow-2xl space-y-5">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-base font-bold text-white flex items-center gap-2">
+          <i class="fa-solid fa-dice text-indigo-400"></i>
+          Simular Nuevos Datos
+        </h3>
+        <button onclick="cerrarModalSimulacion()" class="text-slate-400 hover:text-white">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <div class="space-y-4 text-xs">
+        <div>
+          <label class="block font-semibold text-slate-300 mb-1.5 flex justify-between">
+            <span>Cantidad de Técnicos:</span>
+            <span id="label-num-tecnicos" class="text-indigo-400 font-bold">4</span>
+          </label>
+          <input type="range" id="input-num-tecnicos" min="2" max="8" value="4" oninput="document.getElementById('label-num-tecnicos').innerText = this.value" class="w-full accent-indigo-500 cursor-pointer">
+        </div>
+
+        <div>
+          <label class="block font-semibold text-slate-300 mb-1.5 flex justify-between">
+            <span>Cantidad de Órdenes (OTs):</span>
+            <span id="label-num-ordenes" class="text-sky-400 font-bold">15</span>
+          </label>
+          <input type="range" id="input-num-ordenes" min="5" max="40" value="15" oninput="document.getElementById('label-num-ordenes').innerText = this.value" class="w-full accent-sky-500 cursor-pointer">
+        </div>
+
+        <div class="bg-slate-950 p-3 rounded-lg border border-slate-800 text-[11px] text-slate-400">
+          <i class="fa-solid fa-circle-info text-sky-400 mr-1"></i>
+          Se generarán direcciones reales en Santiago, nombres chilenos, horarios de visita y tipos de trabajo aleatorios.
+        </div>
+      </div>
+
+      <div class="flex justify-end gap-2.5 pt-2">
+        <button onclick="cerrarModalSimulacion()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold">
+          Cancelar
+        </button>
+        <button onclick="ejecutarRegeneracion()" class="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center gap-1.5">
+          <i class="fa-solid fa-arrows-rotate"></i>
+          <span>Generar y Cargar</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Loading Overlay -->
+  <div id="loading-overlay" class="fixed inset-0 bg-slate-950/75 backdrop-blur-sm z-50 hidden flex flex-col items-center justify-center space-y-3">
+    <div class="w-12 h-12 border-4 border-sky-500/20 border-t-sky-500 rounded-full animate-spin"></div>
+    <div id="loading-text" class="text-sm font-bold text-slate-200">Procesando...</div>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="toast" class="fixed bottom-6 right-6 z-50 bg-slate-900/95 border border-slate-700 text-white px-4 py-3 rounded-xl shadow-2xl text-xs font-bold hidden items-center gap-2.5 backdrop-blur-md">
+    <i id="toast-icon" class="fa-solid fa-circle-check text-emerald-400"></i>
+    <span id="toast-msg">Mensaje</span>
+  </div>
+
+  <!-- Script Logic -->
+  <script>
+    const API_BASE = window.location.origin + "/api";
+    
+    const COLOR_PALETTE = [
+      { hex: '#0284c7', name: 'Sky' },
+      { hex: '#10b981', name: 'Emerald' },
+      { hex: '#8b5cf6', name: 'Purple' },
+      { hex: '#f59e0b', name: 'Amber' },
+      { hex: '#ec4899', name: 'Pink' },
+      { hex: '#14b8a6', name: 'Teal' },
+      { hex: '#ef4444', name: 'Red' },
+      { hex: '#6366f1', name: 'Indigo' },
+    ];
+
+    let map;
+    let markersLayer;
+    let routesLayer;
+    let currentTecnicos = [];
+    let currentOrdenes = [];
+    let currentRutas = [];
+    let currentConfig = {};
+
+    function initMap() {
+      const capaVoyager = L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+        maxZoom: 19
+      });
+
+      const capaDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+        maxZoom: 19
+      });
+
+      const capaLight = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+        attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+        maxZoom: 19
+      });
+
+      const capaSatelital = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+        attribution: 'Tiles &copy; Esri',
+        maxZoom: 18
+      });
+
+      const capaOSM = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; OpenStreetMap contributors',
+        maxZoom: 19
+      });
+
+      map = L.map('map', { 
+        zoomControl: false,
+        layers: [capaVoyager]
+      }).setView([-33.4489, -70.6693], 12);
+      
+      L.control.zoom({ position: 'topright' }).addTo(map);
+
+      const baseMaps = {
+        "🗺️ Mapa Urbano": capaVoyager,
+        "🌙 Modo Oscuro": capaDark,
+        "☀️ Modo Claro": capaLight,
+        "🛰️ Vista Satélite": capaSatelital,
+        "🌐 OpenStreetMap": capaOSM
+      };
+
+      L.control.layers(baseMaps, null, { position: 'topright' }).addTo(map);
+
+      markersLayer = L.layerGroup().addTo(map);
+      routesLayer = L.layerGroup().addTo(map);
+    }
+
+    async function cargarDatosIniciales() {
+      mostrarLoading("Cargando datos del sistema...");
+      try {
+        await Promise.all([
+          cargarMetricas(),
+          cargarTecnicos(),
+          cargarOrdenes(),
+          cargarRutas(),
+          cargarConfiguracion()
+        ]);
+      } catch (err) {
+        console.error("Error cargando datos:", err);
+      } finally {
+        ocultarLoading();
+      }
+    }
+
+    async function cargarMetricas() {
+      try {
+        const res = await fetch(`${API_BASE}/metricas/resumen-diario`);
+        const data = await res.json();
+        
+        document.getElementById('kpi-total-ots').innerText = data.kpis_ordenes.total_ots;
+        document.getElementById('kpi-asignadas').innerText = data.kpis_ordenes.asignadas;
+        document.getElementById('kpi-pendientes').innerText = data.kpis_ordenes.pendientes;
+        document.getElementById('kpi-tasa').innerText = `${data.kpis_ordenes.tasa_asignacion_pct}%`;
+        document.getElementById('kpi-tecnicos').innerText = data.kpis_flota.disponibles_hoy;
+        document.getElementById('kpi-activos').innerText = data.kpis_flota.tecnicos_activos_con_ruta;
+      } catch (e) {
+        console.warn("Fallo cargando metricas", e);
+      }
+    }
+
+    async function cargarTecnicos() {
+      try {
+        const res = await fetch(`${API_BASE}/tecnicos`);
+        currentTecnicos = await res.json();
+        renderizarListaTecnicos();
+      } catch (e) {
+        console.warn("Fallo cargando tecnicos", e);
+      }
+    }
+
+    async function cargarOrdenes() {
+      try {
+        const res = await fetch(`${API_BASE}/ordenes`);
+        currentOrdenes = await res.json();
+        renderizarListaOrdenes(currentOrdenes);
+      } catch (e) {
+        console.warn("Fallo cargando ordenes", e);
+      }
+    }
+
+    async function cargarRutas() {
+      try {
+        const res = await fetch(`${API_BASE}/rutas`);
+        currentRutas = await res.json();
+        renderizarHojasDeRuta();
+        dibujarMapa();
+      } catch (e) {
+        console.warn("Fallo cargando rutas", e);
+      }
+    }
+
+    // --- Gestion de Configuracion VRP ---
+    async function cargarConfiguracion() {
+      try {
+        const res = await fetch(`${API_BASE}/optimizador/configuracion`);
+        currentConfig = await res.json();
+        poblarFormularioConfiguracion(currentConfig);
+      } catch (e) {
+        console.warn("Fallo cargando configuracion", e);
+      }
+    }
+
+    function poblarFormularioConfiguracion(cfg) {
+      const st = cfg.tiempos_servicio_por_tipo || {};
+      document.getElementById('cfg-st-instalacion-simple').value = st.instalacion_simple || 45;
+      document.getElementById('cfg-st-instalacion-corte').value = st.instalacion_con_corte || 90;
+      document.getElementById('cfg-st-mantencion').value = st.mantencion || 40;
+      document.getElementById('cfg-st-retiro').value = st.retiro || 25;
+
+      document.getElementById('cfg-inicio-jornada').value = cfg.inicio_jornada_horas || 8;
+      document.getElementById('cfg-fin-jornada').value = cfg.fin_jornada_minutos || 600;
+      document.getElementById('cfg-cap-interno').value = cfg.capacidad_max_interno || 12;
+      document.getElementById('cfg-cap-externo').value = cfg.capacidad_max_externo || 8;
+
+      document.getElementById('cfg-sinuosidad').value = cfg.factor_sinuosidad_vial || 1.30;
+      document.getElementById('cfg-velocidad').value = cfg.velocidad_promedio_kmh || 30.0;
+      document.getElementById('cfg-solver-time').value = cfg.solver_time_limit_seconds || 10;
+      document.getElementById('cfg-span-cost').value = cfg.span_cost_coefficient || 50;
+
+      document.getElementById('cfg-usar-osrm').checked = cfg.usar_osrm !== false;
+    }
+
+    async function guardarConfiguracion() {
+      mostrarLoading("Guardando nuevos parámetros VRP...");
+      const nuevoPayload = {
+        tiempos_servicio_por_tipo: {
+          instalacion_simple: parseInt(document.getElementById('cfg-st-instalacion-simple').value),
+          instalacion_con_corte: parseInt(document.getElementById('cfg-st-instalacion-corte').value),
+          mantencion: parseInt(document.getElementById('cfg-st-mantencion').value),
+          retiro: parseInt(document.getElementById('cfg-st-retiro').value),
+        },
+        inicio_jornada_horas: parseInt(document.getElementById('cfg-inicio-jornada').value),
+        fin_jornada_minutos: parseInt(document.getElementById('cfg-fin-jornada').value),
+        capacidad_max_interno: parseInt(document.getElementById('cfg-cap-interno').value),
+        capacidad_max_externo: parseInt(document.getElementById('cfg-cap-externo').value),
+        factor_sinuosidad_vial: parseFloat(document.getElementById('cfg-sinuosidad').value),
+        velocidad_promedio_kmh: parseFloat(document.getElementById('cfg-velocidad').value),
+        solver_time_limit_seconds: parseInt(document.getElementById('cfg-solver-time').value),
+        span_cost_coefficient: parseInt(document.getElementById('cfg-span-cost').value),
+        usar_osrm: document.getElementById('cfg-usar-osrm').checked
+      };
+
+      try {
+        const res = await fetch(`${API_BASE}/optimizador/configuracion`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(nuevoPayload)
+        });
+        const data = await res.json();
+        currentConfig = data.configuracion;
+        cerrarModalConfiguracion();
+        mostrarToast("Parámetros VRP actualizados con éxito", "fa-circle-check", "text-emerald-400");
+      } catch (e) {
+        alert("Error guardando configuración: " + e);
+      } finally {
+        ocultarLoading();
+      }
+    }
+
+    async function restaurarConfiguracion() {
+      if (!confirm("¿Deseas restaurar todos los parámetros a sus valores por defecto?")) return;
+      mostrarLoading("Restaurando valores por defecto...");
+      try {
+        const res = await fetch(`${API_BASE}/optimizador/configuracion/restaurar`, { method: 'POST' });
+        const data = await res.json();
+        currentConfig = data.configuracion;
+        poblarFormularioConfiguracion(currentConfig);
+        mostrarToast("Parámetros restaurados a valores por defecto", "fa-rotate-left", "text-amber-400");
+      } catch (e) {
+        alert("Error restaurando configuración: " + e);
+      } finally {
+        ocultarLoading();
+      }
+    }
+
+    function abrirModalConfiguracion() {
+      poblarFormularioConfiguracion(currentConfig);
+      document.getElementById('modal-configuracion').classList.remove('hidden');
+    }
+    function cerrarModalConfiguracion() {
+      document.getElementById('modal-configuracion').classList.add('hidden');
+    }
+
+    function renderizarListaTecnicos() {
+      const cont = document.getElementById('contenedor-tecnicos');
+      cont.innerHTML = currentTecnicos.map((t, idx) => {
+        const color = COLOR_PALETTE[idx % COLOR_PALETTE.length].hex;
+        return `
+          <div class="bg-slate-800/70 border border-slate-700/70 rounded-xl p-3 flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+              <div class="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-white text-xs" style="background-color: ${color}">
+                ${t.nombre.charAt(0)}
+              </div>
+              <div>
+                <div class="text-xs font-bold text-white">${t.nombre} ${t.apellidos}</div>
+                <div class="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
+                  <i class="fa-solid fa-house-chimney text-slate-500"></i> Base: <strong>${t.zona}</strong>
+                </div>
+              </div>
+            </div>
+            <div class="text-right">
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${t.tipo === 'interno' ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'}">
+                ${t.tipo.toUpperCase()}
+              </span>
+              <div class="text-[10px] text-slate-500 mt-1">Cap: ${t.cap_max || 8} OTs</div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderizarListaOrdenes(lista) {
+      const cont = document.getElementById('contenedor-ordenes');
+      if (!lista.length) {
+        cont.innerHTML = `<div class="text-center py-6 text-slate-500 text-xs">No se encontraron órdenes.</div>`;
+        return;
+      }
+      cont.innerHTML = lista.map(ot => {
+        const estadoColor = ot.estado === 'por_asignar' ? 'text-amber-400 bg-amber-500/10 border-amber-500/30' : 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30';
+        return `
+          <div class="bg-slate-800/60 border border-slate-700/60 hover:border-slate-600 rounded-xl p-3 text-xs space-y-1.5 transition-all">
+            <div class="flex items-center justify-between">
+              <span class="font-mono font-bold text-sky-400">${ot.id}</span>
+              <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full border ${estadoColor}">
+                ${ot.estado.replace('_', ' ')}
+              </span>
+            </div>
+            <div class="text-slate-200 font-semibold truncate">${ot.cliente || 'Cliente Particular'}</div>
+            <div class="text-[11px] text-slate-400 truncate flex items-center gap-1">
+              <i class="fa-solid fa-location-dot text-slate-500"></i> ${ot.direccion_instalacion}
+            </div>
+            <div class="flex items-center justify-between text-[11px] pt-1 border-t border-slate-800/80 text-slate-400">
+              <span><i class="fa-solid fa-wrench mr-1"></i>${ot.tipo.replace('_', ' ')}</span>
+              <span><i class="fa-regular fa-clock mr-1"></i>${ot.hora_programada || 'Horario Libre'}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function filtrarOTs() {
+      const query = document.getElementById('filtro-ots').value.toLowerCase();
+      const filtradas = currentOrdenes.filter(o => 
+        o.id.toLowerCase().includes(query) ||
+        (o.cliente && o.cliente.toLowerCase().includes(query)) ||
+        o.direccion_instalacion.toLowerCase().includes(query)
+      );
+      renderizarListaOrdenes(filtradas);
+    }
+
+    function renderizarHojasDeRuta() {
+      const cont = document.getElementById('contenedor-rutas');
+      if (!currentRutas.length) {
+        cont.innerHTML = `
+          <div class="text-center py-12 text-slate-500 text-xs">
+            <i class="fa-solid fa-route text-3xl mb-2 text-slate-600 block"></i>
+            Haz clic en <strong>"Optimizar Rutas"</strong> para calcular el plan de despacho.
+          </div>
+        `;
+        return;
+      }
+
+      cont.innerHTML = currentRutas.map((r, idx) => {
+        const color = COLOR_PALETTE[idx % COLOR_PALETTE.length].hex;
+        return `
+          <div class="bg-slate-800/80 border border-slate-700/80 rounded-xl overflow-hidden shadow-md">
+            <div class="p-3.5 bg-slate-800/90 border-b border-slate-700/70 flex items-center justify-between">
+              <div class="flex items-center space-x-2.5">
+                <span class="w-3.5 h-3.5 rounded-full inline-block shadow-sm" style="background-color: ${color}"></span>
+                <div>
+                  <h4 class="text-xs font-bold text-white">${r.nombre}</h4>
+                  <div class="text-[10px] text-slate-400">🏠 ${r.zona_base} • ${r.paradas.length} paradas</div>
+                </div>
+              </div>
+              <div class="text-right">
+                <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-900 border border-slate-700 text-slate-300">
+                  ${r.hora_salida_base || '--'} ➔ ${r.hora_retorno_base || '--'}
+                </span>
+              </div>
+            </div>
+
+            <div class="p-2.5 space-y-2 max-h-56 overflow-y-auto">
+              ${r.paradas.map(p => `
+                <div onclick="enfocarParada(${p.latitud}, ${p.longitud}, '${p.ot_id}')" class="group bg-slate-900/70 hover:bg-slate-700/40 border border-slate-800 hover:border-slate-600 rounded-lg p-2 text-xs flex items-center justify-between cursor-pointer transition-all">
+                  <div class="flex items-center space-x-2.5 truncate">
+                    <span class="w-5 h-5 rounded-full text-white flex items-center justify-center font-bold text-[10px]" style="background-color: ${color}">
+                      ${p.secuencia}
+                    </span>
+                    <div class="truncate">
+                      <div class="font-bold text-slate-200 truncate group-hover:text-sky-400 transition-colors">
+                        ${p.ot_id} <span class="font-normal text-slate-400">(${p.cliente || 'Particular'})</span>
+                      </div>
+                      <div class="text-[10px] text-slate-400 truncate">${p.direccion}</div>
+                    </div>
+                  </div>
+                  <div class="text-right flex-shrink-0 pl-2">
+                    <div class="font-mono text-[10px] font-bold text-sky-400">${p.hora_estimada_llegada || '--'}</div>
+                    <div class="text-[9px] text-slate-500">${p.duracion_servicio_min || 30} min</div>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    const ZONAS_COORDENADAS_JS = {
+      "Santiago Centro": [-33.4372, -70.6572],
+      "Providencia": [-33.4289, -70.6080],
+      "Las Condes": [-33.3937, -70.5840],
+      "Vitacura": [-33.3999, -70.5731],
+      "Nunoa": [-33.4520, -70.6120],
+      "La Florida": [-33.4930, -70.5863],
+      "Maipu": [-33.4865, -70.7602],
+      "Pudahuel": [-33.4584, -70.7838],
+      "Quilicura": [-33.3752, -70.7715],
+      "Penalolen": [-33.4750, -70.5709],
+      "La Reina": [-33.4688, -70.5507],
+      "Macul": [-33.4804, -70.6224],
+      "San Miguel": [-33.5034, -70.7097],
+      "La Cisterna": [-33.5193, -70.6529],
+      "El Bosque": [-33.5431, -70.6675],
+      "Puente Alto": [-33.6142, -70.5755],
+      "San Bernardo": [-33.6002, -70.7243],
+      "Lo Barnechea": [-33.3559, -70.5250],
+      "Cerrillos": [-33.5028, -70.7425],
+      "Estacion Central": [-33.4578, -70.6676],
+    };
+
+    async function obtenerGeometriaCalles(puntos) {
+      if (puntos.length < 2) return null;
+      // puntos: [[lat, lon], ...] -> OSRM espera lon,lat;lon,lat;...
+      const coordsStr = puntos.map(pt => `${pt[1]},${pt[0]}`).join(';');
+      try {
+        const res = await fetch(`${API_BASE}/ruteo/geometria?coordenadas=${encodeURIComponent(coordsStr)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.coordenadas && data.coordenadas.length > 0) {
+            return {
+              coordenadas: data.coordenadas,
+              distancia_metros: data.distancia_metros,
+              duracion_segundos: data.duracion_segundos
+            };
+          }
+        }
+      } catch (err) {
+        console.warn("Fallo endpoint backend de geometría, intentando OSRM directo...", err);
+      }
+
+      // Fallback: consulta directa a OSRM desde cliente si la API backend fallase
+      try {
+        const urlDirecta = `http://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson`;
+        const res2 = await fetch(urlDirecta);
+        if (res2.ok) {
+          const data2 = await res2.json();
+          if (data2.routes && data2.routes[0]) {
+            const coords = data2.routes[0].geometry.coordinates.map(c => [c[1], c[0]]);
+            return {
+              coordenadas: coords,
+              distancia_metros: data2.routes[0].distance,
+              duracion_segundos: data2.routes[0].duration
+            };
+          }
+        }
+      } catch (err2) {
+        console.warn("Fallo OSRM directo", err2);
+      }
+
+      // Fallback final: devolver los puntos directos
+      return { coordenadas: puntos };
+    }
+
+    async function dibujarMapa() {
+      markersLayer.clearLayers();
+      routesLayer.clearLayers();
+      const legend = document.getElementById('map-legend-items');
+
+      if (!currentRutas.length) {
+        legend.innerHTML = `<div class="text-slate-500 text-[11px]">Sin rutas calculadas.</div>`;
+        return;
+      }
+
+      legend.innerHTML = `
+        <div class="mb-2 pb-1.5 border-b border-slate-800 flex items-center justify-between text-[10px] text-slate-400">
+          <span>Trazado Vial:</span>
+          <span class="text-emerald-400 font-bold bg-emerald-500/10 border border-emerald-500/30 px-1.5 py-0.5 rounded flex items-center gap-1">
+            <i class="fa-solid fa-road text-[9px]"></i> Calles OSRM
+          </span>
+        </div>
+      `;
+      const allBounds = [];
+
+      // Procesar cada ruta
+      for (let idx = 0; idx < currentRutas.length; idx++) {
+        const r = currentRutas[idx];
+        const color = COLOR_PALETTE[idx % COLOR_PALETTE.length].hex;
+
+        // Determinar coordenadas de base del técnico
+        let basePt = null;
+        if (r.base_latitud && r.base_longitud) {
+          basePt = [r.base_latitud, r.base_longitud];
+        } else if (r.zona_base && ZONAS_COORDENADAS_JS[r.zona_base]) {
+          basePt = ZONAS_COORDENADAS_JS[r.zona_base];
+        }
+
+        const paradasValidas = r.paradas.filter(p => p.latitud && p.longitud);
+
+        legend.innerHTML += `
+          <div class="flex items-center justify-between text-[11px] text-slate-300 py-0.5">
+            <div class="flex items-center space-x-2 truncate">
+              <span class="w-3 h-3 rounded-full flex-shrink-0" style="background-color: ${color}"></span>
+              <span class="truncate font-semibold">${r.nombre}</span>
+            </div>
+            <span class="text-[10px] text-slate-500 pl-2 font-mono flex-shrink-0">${paradasValidas.length} OTs</span>
+          </div>
+        `;
+
+        if (basePt) {
+          allBounds.push(basePt);
+          const iconBase = L.divIcon({
+            className: 'custom-div-icon',
+            html: `<div class="tech-marker" style="background-color: ${color}; width: 28px; height: 28px; border-radius: 8px; font-size: 13px; box-shadow: 0 0 12px ${color}88;">
+              <i class="fa-solid fa-house"></i>
+            </div>`,
+            iconSize: [28, 28],
+            iconAnchor: [14, 14]
+          });
+
+          const baseMarker = L.marker(basePt, { icon: iconBase }).addTo(markersLayer);
+          baseMarker.bindPopup(`
+            <div class="font-sans text-xs space-y-1.5 text-slate-900">
+              <div class="font-bold text-sm text-sky-800 flex items-center gap-1.5 border-b pb-1">
+                <i class="fa-solid fa-house"></i> Base Operativa del Técnico
+              </div>
+              <div><strong>Técnico:</strong> ${r.nombre} (${r.tipo})</div>
+              <div><strong>Comuna Base:</strong> ${r.zona_base || 'Santiago'}</div>
+              <div><strong>Horario de Jornada:</strong> ${r.hora_salida_base || '--'} ➔ ${r.hora_retorno_base || '--'}</div>
+              <div><strong>Carga Asignada:</strong> ${r.capacidad_uso || paradasValidas.length + ' OTs'}</div>
+            </div>
+          `);
+        }
+
+        // Crear marcadores de cada parada numerada
+        paradasValidas.forEach(p => {
+          const pt = [p.latitud, p.longitud];
+          allBounds.push(pt);
+
+          const icon = L.divIcon({
+            className: 'custom-div-icon',
+            html: `<div class="tech-marker" style="background-color: ${color}; width: 24px; height: 24px; font-size: 11px;">${p.secuencia}</div>`,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+          });
+
+          const marker = L.marker(pt, { icon }).addTo(markersLayer);
+          marker.bindPopup(`
+            <div class="font-sans text-xs space-y-1 text-slate-900">
+              <div class="font-bold text-sm text-sky-700 flex justify-between items-center border-b pb-1">
+                <span>${p.ot_id}</span>
+                <span class="text-xs bg-sky-100 text-sky-800 px-2 py-0.5 rounded font-bold">Parada #${p.secuencia}</span>
+              </div>
+              <div><strong>Técnico Asignado:</strong> ${r.nombre}</div>
+              <div><strong>Cliente:</strong> ${p.cliente || 'Particular'}</div>
+              <div><strong>Dirección:</strong> ${p.direccion}</div>
+              <div><strong>Horario Estimado:</strong> <span class="font-bold text-sky-800">${p.hora_estimada_llegada} - ${p.hora_estimada_salida}</span></div>
+              <div><strong>Tipo Servicio:</strong> ${p.tipo.replace('_', ' ')} (${p.duracion_servicio_min || 30} min)</div>
+              <div><strong>Sector:</strong> ${p.sector || r.zona_base}</div>
+            </div>
+          `);
+        });
+
+        // Construir secuencia completa de puntos: Base -> Paradas -> Base
+        if (paradasValidas.length > 0) {
+          const waypoints = [];
+          if (basePt) waypoints.push(basePt);
+          paradasValidas.forEach(p => waypoints.push([p.latitud, p.longitud]));
+          if (basePt) waypoints.push(basePt);
+
+          if (waypoints.length >= 2) {
+            // Trazar línea temporal guía mientras OSRM responde
+            const tempLine = L.polyline(waypoints, {
+              color: color,
+              weight: 2,
+              opacity: 0.35,
+              dashArray: '4, 8'
+            }).addTo(routesLayer);
+
+            // Consultar geometría de calles exacta a OSRM
+            obtenerGeometriaCalles(waypoints).then(info => {
+              if (!info || !info.coordenadas || info.coordenadas.length === 0) return;
+              
+              // Remover línea temporal
+              routesLayer.removeLayer(tempLine);
+
+              // 1. Línea de borde oscuro para contraste en cualquier mapa
+              L.polyline(info.coordenadas, {
+                color: '#020617',
+                weight: 6.5,
+                opacity: 0.65,
+                lineCap: 'round',
+                lineJoin: 'round'
+              }).addTo(routesLayer);
+
+              // 2. Línea principal de calle con el color del técnico
+              const streetLine = L.polyline(info.coordenadas, {
+                color: color,
+                weight: 4.5,
+                opacity: 0.95,
+                lineCap: 'round',
+                lineJoin: 'round'
+              }).addTo(routesLayer);
+
+              const distKm = info.distancia_metros ? (info.distancia_metros / 1000.0).toFixed(1) + ' km' : '';
+              const tiempoMin = info.duracion_segundos ? Math.round(info.duracion_segundos / 60.0) + ' min' : '';
+
+              streetLine.bindTooltip(`
+                <div class="text-xs font-sans">
+                  <strong>Ruta de ${r.nombre}</strong><br>
+                  ${distKm ? '🚗 Distancia real: ' + distKm + '<br>' : ''}
+                  ${tiempoMin ? '⏱️ Tiempo viaje estimado: ' + tiempoMin : ''}
+                </div>
+              `, { sticky: true });
+
+              streetLine.on('mouseover', function() {
+                this.setStyle({ weight: 7, opacity: 1.0 });
+              });
+              streetLine.on('mouseout', function() {
+                this.setStyle({ weight: 4.5, opacity: 0.95 });
+              });
+            });
+          }
+        }
+      }
+
+      if (allBounds.length > 0) {
+        map.fitBounds(allBounds, { padding: [40, 40] });
+      }
+    }
+
+    function enfocarParada(lat, lon, otId) {
+      if (lat && lon) {
+        map.flyTo([lat, lon], 15, { duration: 1.2 });
+      }
+    }
+
+    async function ejecutarOptimizacion() {
+      mostrarLoading("Ejecutando motor Google OR-Tools VRP...");
+      try {
+        const res = await fetch(`${API_BASE}/optimizador/ejecutar`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            aplicar_cambios: true,
+            tiempo_limite_segundos: currentConfig.solver_time_limit_seconds || 10
+          })
+        });
+        const result = await res.json();
+        
+        await Promise.all([
+          cargarMetricas(),
+          cargarOrdenes(),
+          cargarRutas()
+        ]);
+
+        cambiarTab('rutas');
+        mostrarToast("Optimización completada exitosamente", "fa-bolt", "text-sky-400");
+      } catch (err) {
+        alert("Error ejecutando optimización: " + err);
+      } finally {
+        ocultarLoading();
+      }
+    }
+
+    async function ejecutarRegeneracion() {
+      cerrarModalSimulacion();
+      mostrarLoading("Generando nuevos datos y direcciones en Santiago...");
+      
+      const numTec = parseInt(document.getElementById('input-num-tecnicos').value);
+      const numOrd = parseInt(document.getElementById('input-num-ordenes').value);
+
+      try {
+        await fetch(`${API_BASE}/simulacion/regenerar`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            num_tecnicos: numTec,
+            num_ordenes: numOrd,
+            dias_disponibilidad: 14
+          })
+        });
+
+        await cargarDatosIniciales();
+        cambiarTab('ordenes');
+        mostrarToast("Nuevos datos simulados cargados", "fa-dice", "text-indigo-400");
+      } catch (err) {
+        alert("Error regenerando datos: " + err);
+      } finally {
+        ocultarLoading();
+      }
+    }
+
+    function cambiarTab(tabName) {
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('border-sky-500', 'text-sky-400', 'font-bold');
+        btn.classList.add('border-transparent', 'text-slate-400');
+      });
+      document.querySelectorAll('.tab-panel').forEach(p => p.classList.add('hidden'));
+
+      const activeBtn = document.getElementById(`tab-btn-${tabName}`);
+      const activePanel = document.getElementById(`tab-content-${tabName}`);
+      
+      if (activeBtn && activePanel) {
+        activeBtn.classList.remove('border-transparent', 'text-slate-400');
+        activeBtn.classList.add('border-sky-500', 'text-sky-400', 'font-bold');
+        activePanel.classList.remove('hidden');
+      }
+    }
+
+    function abrirModalSimulacion() {
+      document.getElementById('modal-simulacion').classList.remove('hidden');
+    }
+    function cerrarModalSimulacion() {
+      document.getElementById('modal-simulacion').classList.add('hidden');
+    }
+
+    function mostrarToast(msg, icon = "fa-circle-check", iconColor = "text-emerald-400") {
+      const toast = document.getElementById('toast');
+      document.getElementById('toast-msg').innerText = msg;
+      const iEl = document.getElementById('toast-icon');
+      iEl.className = `fa-solid ${icon} ${iconColor}`;
+      toast.classList.remove('hidden');
+      toast.classList.add('flex');
+      setTimeout(() => {
+        toast.classList.add('hidden');
+        toast.classList.remove('flex');
+      }, 3500);
+    }
+
+    function mostrarLoading(texto = "Cargando...") {
+      document.getElementById('loading-text').innerText = texto;
+      document.getElementById('loading-overlay').classList.remove('hidden');
+    }
+    function ocultarLoading() {
+      document.getElementById('loading-overlay').classList.add('hidden');
+    }
+
+    window.onload = () => {
+      initMap();
+      cargarDatosIniciales();
+    };
+  </script>
+</body>
+</html>

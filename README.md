@@ -1,1 +1,0 @@
-# optimizador-demo
