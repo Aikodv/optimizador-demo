@@ -279,7 +279,7 @@ class AsignacionesMasivasRequest(BaseModel):
 
 class EjecutarOptimizacionRequest(BaseModel):
     fecha: Optional[str] = None
-    aplicar_cambios: bool = True
+    aplicar_cambios: bool = False
     tiempo_limite_segundos: int = 10
 
 class RegenerarDatosRequest(BaseModel):
@@ -410,7 +410,7 @@ def asignar_tecnico(id: str, body: AsignarTecnicoRequest):
     orden = next((o for o in DB_ORDENES if o["id"] == id), None)
     if orden:
         orden["tecnico_id"] = body.tecnico_id
-        orden["estado"] = "asignacion_por_confirmar"
+        # Mantener el estado original de la orden sin mutar
         return orden
     raise HTTPException(status_code=404, detail=f"OT '{id}' no encontrada.")
 
@@ -442,8 +442,7 @@ def asignaciones_masivas(body: AsignacionesMasivasRequest):
         orden["secuencia"] = asig.secuencia
         orden["hora_estimada_llegada"] = asig.hora_estimada_llegada
         orden["hora_estimada_salida"] = asig.hora_estimada_salida
-        if orden["estado"] in ("por_revisar", "por_asignar"):
-            orden["estado"] = "asignacion_por_confirmar"
+        # Preservar el estado original de la orden sin mutar
 
         tec_id = asig.tecnico_id
         if tec_id not in DB_RUTAS_PLANIFICADAS[fecha]:
@@ -672,10 +671,14 @@ def get_metricas_resumen(fecha: Optional[str] = None):
         disponibles = [d for d in DB_DISPONIBILIDADES if d.get("fecha") == target_fecha and d.get("disponible")]
 
     total_ots = len(ordenes)
-    ots_asignadas = sum(1 for o in ordenes if o.get("tecnico_id") is not None)
-    ots_pendientes = total_ots - ots_asignadas
-    
     rutas_dia = DB_RUTAS_PLANIFICADAS.get(target_fecha) or DB_RUTAS_PLANIFICADAS.get("default", {})
+    ots_en_rutas = sum(len(r.get("paradas", [])) for r in rutas_dia.values())
+    
+    ots_asignadas = sum(1 for o in ordenes if o.get("tecnico_id") is not None)
+    if ots_asignadas == 0 and ots_en_rutas > 0:
+        ots_asignadas = ots_en_rutas
+    ots_pendientes = max(0, total_ots - ots_asignadas)
+    
     tecnicos_con_ruta = len([r for r in rutas_dia.values() if r.get("total_ots", 0) > 0])
     
     pct_asignacion = (ots_asignadas / total_ots * 100.0) if total_ots > 0 else 0.0

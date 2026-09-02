@@ -1065,7 +1065,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            aplicar_cambios: true,
+            aplicar_cambios: false,
             tiempo_limite_segundos: currentConfig.solver_time_limit_seconds || 10
           })
         });

@@ -21,7 +21,7 @@ COMUNAS_JSON_PATH = BASE_DIR / "Latitud - Longitud Chile.json"
 GEOCODING_CACHE_PATH = BASE_DIR / "geocoding_cache.json"
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
-APLICAR_CAMBIOS = os.environ.get("APLICAR_CAMBIOS", "False").lower() in ('true', '1', 't')
+APLICAR_CAMBIOS = False
 
 # Bounding Box de Chile
 LAT_MIN, LAT_MAX = -56.5, -17.5
@@ -870,29 +870,7 @@ def enviar_asignaciones(
         rutas_list.append(ruta_dict)
 
     if aplicar_cambios and asignaciones_bulk:
-        bulk_url = f"{api_base_url}/ordenes/asignaciones-masivas"
-        bulk_exitoso = False
-        try:
-            res_bulk = client.patch(bulk_url, json={"asignaciones": asignaciones_bulk}, timeout=10)
-            if res_bulk.status_code == 200:
-                bulk_exitoso = True
-        except Exception:
-            pass
-
-        if not bulk_exitoso:
-            actualizadas_ok = 0
-            for asig in asignaciones_bulk:
-                try:
-                    res_ind = client.patch(
-                        f"{api_base_url}/ordenes/{asig['ot_id']}/tecnico",
-                        json={"tecnico_id": asig["tecnico_id"]},
-                        timeout=10
-                    )
-                    if res_ind.status_code in (200, 204):
-                        actualizadas_ok += 1
-                except Exception as e:
-                    print(f"   [SYNC ERROR] Asignando {asig['ot_id']}: {e}")
-            print(f"   [SYNC] {actualizadas_ok}/{len(asignaciones_bulk)} OTs asignadas exitosamente en {api_base_url}")
+        print(f"   [PLANIFICACION] {len(asignaciones_bulk)} OTs asignadas y planificadas en hojas de ruta (Estados originales preservados sin modificar).")
 
     return {
         "status": "success",
