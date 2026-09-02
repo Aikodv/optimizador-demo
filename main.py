@@ -15,6 +15,7 @@
 #   - Swagger UI:     http://127.0.0.1:8000/docs
 # =============================================================================
 
+import os
 import random
 import uuid
 from datetime import date, timedelta
@@ -36,6 +37,8 @@ from pydantic import BaseModel, Field
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(exist_ok=True)
+
+EXTERNAL_API_BASE = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
 
 fake = Faker("es_CL")
 random.seed(42)
@@ -275,7 +278,7 @@ class AsignacionesMasivasRequest(BaseModel):
     asignaciones: List[AsignacionItem]
 
 class EjecutarOptimizacionRequest(BaseModel):
-    fecha: Optional[str] = Field(default_factory=lambda: date.today().isoformat())
+    fecha: Optional[str] = None
     aplicar_cambios: bool = True
     tiempo_limite_segundos: int = 10
 
@@ -322,74 +325,94 @@ def info():
         "dashboard": "/",
     }
 
-# --- Simulacion y Regeneracion de Datos ---
+# --- Simulacion y Reset de Datos ---
 
+@app.post("/api/reset", tags=["Simulacion"], summary="Resetear base de datos en API externa")
 @app.post(
     "/api/simulacion/regenerar",
     tags=["Simulacion"],
-    summary="Regenerar datos ficticios de prueba (Tecnicos, Disponibilidades, OTs)",
-    response_description="Nuevos datos simulados cargados en memoria.",
+    summary="Regenerar datos en API externa (Reset)",
+    response_description="Datos regenerados en la API.",
 )
-def regenerar_datos(body: RegenerarDatosRequest):
+def regenerar_datos():
     """
-    Regenera la base de datos en memoria con nuevos tecnicos, disponibilidades y ordenes de trabajo.
-    Limpia las hojas de ruta previas para permitir una nueva optimizacion desde cero.
+    Invoca el endpoint POST /api/reset de la API externa para regenerar todos los datos
+    y limpia la caché de hojas de ruta planificadas local.
     """
-    global DB_TECNICOS, DB_DISPONIBILIDADES, DB_ORDENES, DB_RUTAS_PLANIFICADAS
-    
-    DB_TECNICOS = generar_tecnicos(n=body.num_tecnicos)
-    DB_DISPONIBILIDADES = generar_disponibilidades(DB_TECNICOS, dias=body.dias_disponibilidad)
-    DB_ORDENES = generar_ordenes_trabajo(DB_TECNICOS, n=body.num_ordenes)
+    global DB_RUTAS_PLANIFICADAS
     DB_RUTAS_PLANIFICADAS.clear()
-
-    return {
-        "status": "success",
-        "mensaje": f"Base de datos regenerada con exito: {len(DB_TECNICOS)} tecnicos y {len(DB_ORDENES)} OTs.",
-        "total_tecnicos": len(DB_TECNICOS),
-        "total_ordenes": len(DB_ORDENES),
-        "fecha": date.today().isoformat()
-    }
+    try:
+        res = requests.post(f"{EXTERNAL_API_BASE}/reset", timeout=25)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Error reseteando API externa: {e}")
+    return {"status": "success", "mensaje": "Datos reseteados."}
 
 # --- Tecnicos ---
 
 @app.get("/api/tecnicos", tags=["Tecnicos"], summary="Obtener lista de tecnicos")
 def get_tecnicos():
+    try:
+        res = requests.get(f"{EXTERNAL_API_BASE}/tecnicos", timeout=25)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Error consultando /tecnicos en API externa: {e}")
     return DB_TECNICOS
 
 # --- Disponibilidad ---
 
 @app.get("/api/disponibilidad", tags=["Disponibilidad"], summary="Obtener disponibilidades")
-def get_disponibilidad(fecha: Optional[str] = Query(default=None, example="2026-08-26")):
+def get_disponibilidad(fecha: Optional[str] = None):
+    url = f"{EXTERNAL_API_BASE}/disponibilidad"
+    if fecha and isinstance(fecha, str):
+        url += f"?fecha={fecha}"
+    try:
+        res = requests.get(url, timeout=25)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Error consultando /disponibilidad en API externa: {e}")
     if fecha is None:
         return DB_DISPONIBILIDADES
-    try:
-        date.fromisoformat(fecha)
-    except ValueError:
-        raise HTTPException(status_code=422, detail=f"Fecha invalida: '{fecha}'. Use YYYY-MM-DD.")
-    return [d for d in DB_DISPONIBILIDADES if d["fecha"] == fecha]
+    return [d for d in DB_DISPONIBILIDADES if d.get("fecha") == fecha]
 
 # --- Ordenes de Trabajo ---
 
 @app.get("/api/ordenes", tags=["Ordenes de Trabajo"], summary="Obtener lista de ordenes")
-def get_ordenes(estado: Optional[str] = Query(default=None, example="por_asignar")):
+def get_ordenes(estado: Optional[str] = None):
+    url = f"{EXTERNAL_API_BASE}/ordenes"
+    if estado and isinstance(estado, str):
+        url += f"?estado={estado}"
+    try:
+        res = requests.get(url, timeout=25)
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Error consultando /ordenes en API externa: {e}")
     if estado is None:
         return DB_ORDENES
-    if estado not in ESTADOS_OT:
-        raise HTTPException(status_code=422, detail=f"Estado invalido. Permitidos: {', '.join(ESTADOS_OT)}")
-    return [o for o in DB_ORDENES if o["estado"] == estado]
+    return [o for o in DB_ORDENES if o.get("estado") == estado]
 
 @app.patch("/api/ordenes/{id}/tecnico", tags=["Ordenes de Trabajo"], summary="Asignacion individual")
 def asignar_tecnico(id: str, body: AsignarTecnicoRequest):
+    try:
+        res = requests.patch(
+            f"{EXTERNAL_API_BASE}/ordenes/{id}/tecnico",
+            json={"tecnico_id": body.tecnico_id},
+            timeout=15
+        )
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        print(f"Error asignando tecnico en API externa: {e}")
     orden = next((o for o in DB_ORDENES if o["id"] == id), None)
-    if orden is None:
-        raise HTTPException(status_code=404, detail=f"OT '{id}' no encontrada.")
-    tecnico = next((t for t in DB_TECNICOS if t["id"] == body.tecnico_id), None)
-    if tecnico is None:
-        raise HTTPException(status_code=404, detail=f"Tecnico '{body.tecnico_id}' no encontrado.")
-    orden["tecnico_id"] = body.tecnico_id
-    if orden["estado"] in ("por_revisar", "por_asignar"):
+    if orden:
+        orden["tecnico_id"] = body.tecnico_id
         orden["estado"] = "asignacion_por_confirmar"
-    return orden
+        return orden
+    raise HTTPException(status_code=404, detail=f"OT '{id}' no encontrada.")
 
 @app.patch(
     "/api/ordenes/asignaciones-masivas",
@@ -467,13 +490,18 @@ def asignaciones_masivas(body: AsignacionesMasivasRequest):
 
 @app.get("/api/rutas", tags=["Rutas y Despacho"], summary="Consultar hojas de ruta")
 def get_rutas(
-    fecha: Optional[str] = Query(default=None),
-    tecnico_id: Optional[str] = Query(default=None)
+    fecha: Optional[str] = None,
+    tecnico_id: Optional[str] = None
 ):
-    target_fecha = fecha or date.today().isoformat()
-    rutas_dia = DB_RUTAS_PLANIFICADAS.get(target_fecha, {})
+    target_fecha = fecha if isinstance(fecha, str) and fecha else None
+    rutas_dia = DB_RUTAS_PLANIFICADAS.get(target_fecha) if target_fecha else None
+    if not rutas_dia:
+        rutas_dia = DB_RUTAS_PLANIFICADAS.get("default", {})
+    if not rutas_dia and DB_RUTAS_PLANIFICADAS:
+        primera_clave = next(iter(DB_RUTAS_PLANIFICADAS))
+        rutas_dia = DB_RUTAS_PLANIFICADAS[primera_clave]
 
-    if tecnico_id:
+    if tecnico_id and isinstance(tecnico_id, str):
         if tecnico_id in rutas_dia:
             return [rutas_dia[tecnico_id]]
         return []
@@ -547,60 +575,26 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Error importando optimizador: {e}")
 
-    target_fecha = body.fecha or date.today().isoformat()
-    
-    # Obtener técnicos disponibles y órdenes pendientes directamente en memoria
-    disp_hoy = [d for d in DB_DISPONIBILIDADES if d["fecha"] == target_fecha and d.get("disponible")]
-    ids_disponibles = {d["tecnico_id"] for d in disp_hoy}
-    tecnicos_hoy = [t for t in DB_TECNICOS if t["id"] in ids_disponibles]
-    ordenes_pendientes = [o for o in DB_ORDENES if o.get("estado") in ("por_asignar", "por_revisar")]
-
-    if not tecnicos_hoy or not ordenes_pendientes:
-        return {
-            "status": "no_data",
-            "mensaje": f"Faltan técnicos disponibles ({len(tecnicos_hoy)}) u órdenes por asignar ({len(ordenes_pendientes)}) para {target_fecha}.",
-            "kpis": {"total_ots": len(ordenes_pendientes), "asignadas": 0, "pendientes": len(ordenes_pendientes)},
-            "rutas": []
-        }
-
-    # Ejecución sin depender de llamadas HTTP a localhost (vital para Render/producción)
     resultado = optimizar_jornada(
-        fecha=target_fecha,
-        aplicar_cambios=False,
+        fecha=body.fecha,
+        aplicar_cambios=body.aplicar_cambios,
         tiempo_limite_segundos=body.tiempo_limite_segundos,
-        tecnicos=tecnicos_hoy,
-        ordenes=ordenes_pendientes
+        api_base_url=EXTERNAL_API_BASE
     )
 
-    if body.aplicar_cambios and resultado.get("status") == "success":
+    if resultado.get("status") == "success":
+        rutas = resultado.get("rutas", [])
+        target_fecha = body.fecha or date.today().isoformat()
+        
         if target_fecha not in DB_RUTAS_PLANIFICADAS:
             DB_RUTAS_PLANIFICADAS[target_fecha] = {}
 
-        for ruta in resultado.get("rutas", []):
+        for ruta in rutas:
             tec_id = ruta["tecnico_id"]
-            DB_RUTAS_PLANIFICADAS[target_fecha][tec_id] = {
-                "tecnico_id": tec_id,
-                "nombre": ruta["nombre"],
-                "tipo": ruta["tipo"],
-                "zona_base": ruta["zona_base"],
-                "base_latitud": ruta.get("base_latitud"),
-                "base_longitud": ruta.get("base_longitud"),
-                "capacidad_uso": ruta.get("capacidad_uso"),
-                "hora_salida_base": ruta.get("hora_salida_base"),
-                "hora_retorno_base": ruta.get("hora_retorno_base"),
-                "duracion_total_min": ruta.get("duracion_total_min"),
-                "fecha": target_fecha,
-                "paradas": []
-            }
-            for p in ruta.get("paradas", []):
-                DB_RUTAS_PLANIFICADAS[target_fecha][tec_id]["paradas"].append(p)
-                orden = next((o for o in DB_ORDENES if o["id"] == p["ot_id"]), None)
-                if orden:
-                    orden["tecnico_id"] = tec_id
-                    orden["secuencia"] = p["secuencia"]
-                    orden["hora_estimada_llegada"] = p["hora_estimada_llegada"]
-                    orden["hora_estimada_salida"] = p["hora_estimada_salida"]
-                    orden["estado"] = "asignacion_por_confirmar"
+            DB_RUTAS_PLANIFICADAS[target_fecha][tec_id] = ruta
+
+        # Guardar en 'default' para acceso general
+        DB_RUTAS_PLANIFICADAS["default"] = {r["tecnico_id"]: r for r in rutas}
 
     return resultado
 
@@ -645,22 +639,47 @@ def reset_configuracion_optimizador():
 # --- Metricas y KPIs ---
 
 @app.get("/api/metricas/resumen-diario", tags=["Metricas y KPIs"], summary="KPIs diarios")
-def get_metricas_resumen(fecha: Optional[str] = Query(default=None)):
-    target_fecha = fecha or date.today().isoformat()
-    
-    disp_hoy = [d for d in DB_DISPONIBILIDADES if d["fecha"] == target_fecha and d["disponible"]]
-    ids_disponibles = {d["tecnico_id"] for d in disp_hoy}
-    tecnicos_disponibles = [t for t in DB_TECNICOS if t["id"] in ids_disponibles]
-    
-    total_ots = len(DB_ORDENES)
-    ots_asignadas = sum(1 for o in DB_ORDENES if o.get("tecnico_id") is not None)
+def get_metricas_resumen(fecha: Optional[str] = None):
+    target_fecha = fecha if isinstance(fecha, str) and fecha else None
+    ordenes = []
+    try:
+        r_ord = requests.get(f"{EXTERNAL_API_BASE}/ordenes", timeout=20)
+        if r_ord.status_code == 200:
+            ordenes = r_ord.json()
+    except Exception:
+        ordenes = DB_ORDENES
+
+    if not target_fecha and ordenes:
+        fechas_ord = [o.get("fecha_programada") for o in ordenes if o.get("fecha_programada")]
+        if fechas_ord:
+            target_fecha = fechas_ord[0]
+    target_fecha = target_fecha or date.today().isoformat()
+
+    tecnicos = []
+    try:
+        r_tec = requests.get(f"{EXTERNAL_API_BASE}/tecnicos", timeout=20)
+        if r_tec.status_code == 200:
+            tecnicos = r_tec.json()
+    except Exception:
+        tecnicos = DB_TECNICOS
+
+    disponibles = []
+    try:
+        r_disp = requests.get(f"{EXTERNAL_API_BASE}/disponibilidad?fecha={target_fecha}", timeout=20)
+        if r_disp.status_code == 200:
+            disponibles = [d for d in r_disp.json() if d.get("disponible")]
+    except Exception:
+        disponibles = [d for d in DB_DISPONIBILIDADES if d.get("fecha") == target_fecha and d.get("disponible")]
+
+    total_ots = len(ordenes)
+    ots_asignadas = sum(1 for o in ordenes if o.get("tecnico_id") is not None)
     ots_pendientes = total_ots - ots_asignadas
     
-    rutas_dia = DB_RUTAS_PLANIFICADAS.get(target_fecha, {})
+    rutas_dia = DB_RUTAS_PLANIFICADAS.get(target_fecha) or DB_RUTAS_PLANIFICADAS.get("default", {})
     tecnicos_con_ruta = len([r for r in rutas_dia.values() if r.get("total_ots", 0) > 0])
     
     pct_asignacion = (ots_asignadas / total_ots * 100.0) if total_ots > 0 else 0.0
-    pct_utilizacion_flota = (tecnicos_con_ruta / len(tecnicos_disponibles) * 100.0) if tecnicos_disponibles else 0.0
+    pct_utilizacion_flota = (tecnicos_con_ruta / len(disponibles) * 100.0) if disponibles else 0.0
 
     return {
         "fecha": target_fecha,
@@ -671,8 +690,8 @@ def get_metricas_resumen(fecha: Optional[str] = Query(default=None)):
             "tasa_asignacion_pct": round(pct_asignacion, 1)
         },
         "kpis_flota": {
-            "total_tecnicos": len(DB_TECNICOS),
-            "disponibles_hoy": len(tecnicos_disponibles),
+            "total_tecnicos": len(tecnicos),
+            "disponibles_hoy": len(disponibles),
             "tecnicos_activos_con_ruta": tecnicos_con_ruta,
             "tasa_utilizacion_flota_pct": round(pct_utilizacion_flota, 1)
         }

@@ -20,8 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 COMUNAS_JSON_PATH = BASE_DIR / "Latitud - Longitud Chile.json"
 GEOCODING_CACHE_PATH = BASE_DIR / "geocoding_cache.json"
 
-PORT = os.environ.get("PORT", "8000")
-API_BASE_URL = os.environ.get("API_BASE_URL", f"http://127.0.0.1:{PORT}/api")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
 APLICAR_CAMBIOS = os.environ.get("APLICAR_CAMBIOS", "False").lower() in ('true', '1', 't')
 
 # Bounding Box de Chile
@@ -313,10 +312,19 @@ def asegurar_coordenadas_ordenes(
             continue
             
         direccion = ot.get("direccion_instalacion", "").strip()
-        if not direccion:
-            continue
-            
-        dir_canonica = normalizar_texto(limpiar_direccion_para_geocoding(direccion))
+        comuna_ot = ot.get("comuna", "").strip()
+        region_ot = ot.get("region", "").strip()
+        
+        comuna_norm = normalizar_texto(comuna_ot) if comuna_ot else ""
+        if not comuna_norm:
+            comuna_detectada = extraer_comuna_direccion(direccion, comunas_dict)
+            if comuna_detectada:
+                comuna_norm = comuna_detectada
+
+        # Query completa: Dirección, Comuna, Región, Chile
+        partes_dir = [p for p in [direccion, comuna_ot, region_ot, "Chile"] if p]
+        direccion_completa = ", ".join(partes_dir)
+        dir_canonica = normalizar_texto(limpiar_direccion_para_geocoding(direccion_completa))
         
         if dir_canonica in cache:
             lat_c, lon_c = cache[dir_canonica]
@@ -324,7 +332,7 @@ def asegurar_coordenadas_ordenes(
             continue
             
         if usar_geo:
-            lat_geo, lon_geo = geocode_direccion(direccion, session=session)
+            lat_geo, lon_geo = geocode_direccion(direccion_completa, session=session)
             if lat_geo is not None and lon_geo is not None:
                 ot["latitud"], ot["longitud"] = lat_geo, lon_geo
                 cache[dir_canonica] = (lat_geo, lon_geo)
@@ -332,9 +340,9 @@ def asegurar_coordenadas_ordenes(
                 time.sleep(1.0)
                 continue
                 
-        comuna = extraer_comuna_direccion(direccion, comunas_dict)
-        if comuna and comuna in comunas_dict:
-            lat_com, lon_com = comunas_dict[comuna]
+        # Centroide comunal exacto usando comuna_norm
+        if comuna_norm and comuna_norm in comunas_dict:
+            lat_com, lon_com = comunas_dict[comuna_norm]
             ot["latitud"], ot["longitud"] = lat_com, lon_com
         else:
             ot["latitud"], ot["longitud"] = -33.4372, -70.6572
@@ -403,25 +411,63 @@ def obtener_datos_operativos(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Descarga los datos operativos desde la API."""
     print("1. Consumiendo API externa (LECTURA SOLAMENTE)...")
-    target_fecha = fecha or date.today().isoformat()
     client = session or requests
     try:
-        res_tec = client.get(f"{api_base_url}/tecnicos", timeout=10)
+        res_tec = client.get(f"{api_base_url}/tecnicos", timeout=25)
         res_tec.raise_for_status()
         tecnicos_req = res_tec.json()
+
+        res_ord = client.get(f"{api_base_url}/ordenes?estado=por_asignar", timeout=25)
+        res_ord.raise_for_status()
+        ordenes_pendientes = res_ord.json()
+
+        target_fecha = fecha
+        if not target_fecha and ordenes_pendientes:
+            fechas_ord = [o.get("fecha_programada") for o in ordenes_pendientes if o.get("fecha_programada")]
+            if fechas_ord:
+                target_fecha = fechas_ord[0]
+
+        target_fecha = target_fecha or date.today().isoformat()
         
-        res_disp = client.get(f"{api_base_url}/disponibilidad?fecha={target_fecha}", timeout=10)
+        res_disp = client.get(f"{api_base_url}/disponibilidad?fecha={target_fecha}", timeout=25)
         res_disp.raise_for_status()
         disp_req = res_disp.json()
         
         ids_disponibles = {d["tecnico_id"] for d in disp_req if d.get("disponible")}
         tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
+
+        # Fallback 1: Si no hay técnicos para la fecha dada, buscar en la fecha programada de las órdenes
+        if not tecnicos_hoy and ordenes_pendientes:
+            fechas_ord = [o.get("fecha_programada") for o in ordenes_pendientes if o.get("fecha_programada")]
+            if fechas_ord and fechas_ord[0] != target_fecha:
+                nueva_fecha = fechas_ord[0]
+                try:
+                    res_disp2 = client.get(f"{api_base_url}/disponibilidad?fecha={nueva_fecha}", timeout=25)
+                    if res_disp2.status_code == 200:
+                        disp_req2 = res_disp2.json()
+                        ids_disp2 = {d["tecnico_id"] for d in disp_req2 if d.get("disponible")}
+                        if ids_disp2:
+                            target_fecha = nueva_fecha
+                            ids_disponibles = ids_disp2
+                            tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
+                except Exception:
+                    pass
+
+        # Fallback 2: buscar en disponibilidad general
+        if not tecnicos_hoy:
+            try:
+                res_disp_all = client.get(f"{api_base_url}/disponibilidad", timeout=25)
+                if res_disp_all.status_code == 200:
+                    all_disp = res_disp_all.json()
+                    fechas_disp = sorted(list({d["fecha"] for d in all_disp if d.get("disponible")}))
+                    if fechas_disp:
+                        target_fecha = fechas_disp[0]
+                        ids_disponibles = {d["tecnico_id"] for d in all_disp if d.get("disponible") and d.get("fecha") == target_fecha}
+                        tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
+            except Exception:
+                pass
         
-        res_ord = client.get(f"{api_base_url}/ordenes?estado=por_asignar", timeout=10)
-        res_ord.raise_for_status()
-        ordenes_pendientes = res_ord.json()
-        
-        print(f"   [RESUMEN] {len(tecnicos_hoy)} tecnicos disponibles | {len(ordenes_pendientes)} OTs pendientes")
+        print(f"   [RESUMEN] {len(tecnicos_hoy)} tecnicos disponibles | {len(ordenes_pendientes)} OTs pendientes (Fecha: {target_fecha})")
         return tecnicos_hoy, ordenes_pendientes
     except Exception as e:
         print(f"   [ERROR FATAL] Conexion a API: {e}")
@@ -512,6 +558,8 @@ def preparar_modelo_datos(tecnicos: List[Dict[str, Any]], ordenes: List[Dict[str
 
     # Deteccion Semantica de Sectores
     def sector_de_orden(ot: Dict[str, Any]) -> str:
+        if ot.get('comuna'):
+            return ot['comuna'].strip().title()
         dir_inst = ot.get('direccion_instalacion', '')
         comuna = extraer_comuna_direccion(dir_inst, diccionario_comunas)
         if comuna:
@@ -804,9 +852,10 @@ def enviar_asignaciones(
         
         base_lon, base_lat = data.get('coords_bases', [])[vehicle_id] if vehicle_id < len(data.get('coords_bases', [])) else (None, None)
         
+        nombre_completo = f"{tecnico_actual.get('nombre', '')} {tecnico_actual.get('apellidos', '')}".strip() or tecnico_actual.get('nombre', 'Tecnico')
         ruta_dict = {
             "tecnico_id": tecnico_actual['id'],
-            "nombre": tecnico_actual['nombre'],
+            "nombre": nombre_completo,
             "tipo": tecnico_actual.get('tipo', 'N/A'),
             "zona_base": tecnico_actual.get('zona', 'N/A'),
             "base_latitud": base_lat,
@@ -831,15 +880,19 @@ def enviar_asignaciones(
             pass
 
         if not bulk_exitoso:
+            actualizadas_ok = 0
             for asig in asignaciones_bulk:
                 try:
-                    client.patch(
+                    res_ind = client.patch(
                         f"{api_base_url}/ordenes/{asig['ot_id']}/tecnico",
                         json={"tecnico_id": asig["tecnico_id"]},
                         timeout=10
                     )
-                except Exception:
-                    pass
+                    if res_ind.status_code in (200, 204):
+                        actualizadas_ok += 1
+                except Exception as e:
+                    print(f"   [SYNC ERROR] Asignando {asig['ot_id']}: {e}")
+            print(f"   [SYNC] {actualizadas_ok}/{len(asignaciones_bulk)} OTs asignadas exitosamente en {api_base_url}")
 
     return {
         "status": "success",

@@ -705,7 +705,7 @@
               <div>
                 <div class="text-xs font-bold text-white">${t.nombre} ${t.apellidos}</div>
                 <div class="text-[11px] text-slate-400 flex items-center gap-1.5 mt-0.5">
-                  <i class="fa-solid fa-house-chimney text-slate-500"></i> Base: <strong>${t.zona}</strong>
+                  <i class="fa-solid fa-house-chimney text-slate-500"></i> Base: <strong>${t.zona}</strong> ${t.region ? `<span class="text-slate-500">(${t.region})</span>` : ''}
                 </div>
               </div>
             </div>
@@ -713,7 +713,7 @@
               <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${t.tipo === 'interno' ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'}">
                 ${t.tipo.toUpperCase()}
               </span>
-              <div class="text-[10px] text-slate-500 mt-1">Cap: ${t.cap_max || 8} OTs</div>
+              <div class="text-[10px] text-slate-500 mt-1">Cap: ${t.cap_max || (t.tipo === 'interno' ? 12 : 8)} OTs</div>
             </div>
           </div>
         `;
@@ -732,17 +732,19 @@
           <div class="bg-slate-800/60 border border-slate-700/60 hover:border-slate-600 rounded-xl p-3 text-xs space-y-1.5 transition-all">
             <div class="flex items-center justify-between">
               <span class="font-mono font-bold text-sky-400">${ot.id}</span>
-              <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full border ${estadoColor}">
-                ${ot.estado.replace('_', ' ')}
-              </span>
+              <div class="flex items-center gap-1.5">
+                ${ot.comuna ? `<span class="text-[10px] font-semibold px-2 py-0.5 rounded bg-sky-500/15 border border-sky-500/30 text-sky-400">${ot.comuna}</span>` : ''}
+                <span class="text-[10px] font-semibold px-2 py-0.5 rounded-full border ${estadoColor}">
+                  ${ot.estado.replace('_', ' ')}
+                </span>
+              </div>
             </div>
-            <div class="text-slate-200 font-semibold truncate">${ot.cliente || 'Cliente Particular'}</div>
-            <div class="text-[11px] text-slate-400 truncate flex items-center gap-1">
-              <i class="fa-solid fa-location-dot text-slate-500"></i> ${ot.direccion_instalacion}
+            <div class="text-[11px] text-slate-300 truncate flex items-center gap-1">
+              <i class="fa-solid fa-location-dot text-slate-500"></i> ${ot.direccion_instalacion}${ot.comuna ? `, ${ot.comuna}` : ''}
             </div>
             <div class="flex items-center justify-between text-[11px] pt-1 border-t border-slate-800/80 text-slate-400">
               <span><i class="fa-solid fa-wrench mr-1"></i>${ot.tipo.replace('_', ' ')}</span>
-              <span><i class="fa-regular fa-clock mr-1"></i>${ot.hora_programada || 'Horario Libre'}</span>
+              <span><i class="fa-regular fa-clock mr-1"></i>${ot.hora_programada || '12:00'} <span class="text-slate-500">(${ot.fecha_programada || ''})</span></span>
             </div>
           </div>
         `;
@@ -753,7 +755,8 @@
       const query = document.getElementById('filtro-ots').value.toLowerCase();
       const filtradas = currentOrdenes.filter(o => 
         o.id.toLowerCase().includes(query) ||
-        (o.cliente && o.cliente.toLowerCase().includes(query)) ||
+        (o.comuna && o.comuna.toLowerCase().includes(query)) ||
+        (o.region && o.region.toLowerCase().includes(query)) ||
         o.direccion_instalacion.toLowerCase().includes(query)
       );
       renderizarListaOrdenes(filtradas);
