@@ -20,7 +20,8 @@ BASE_DIR = Path(__file__).resolve().parent
 COMUNAS_JSON_PATH = BASE_DIR / "Latitud - Longitud Chile.json"
 GEOCODING_CACHE_PATH = BASE_DIR / "geocoding_cache.json"
 
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api")
+PORT = os.environ.get("PORT", "8000")
+API_BASE_URL = os.environ.get("API_BASE_URL", f"http://127.0.0.1:{PORT}/api")
 APLICAR_CAMBIOS = os.environ.get("APLICAR_CAMBIOS", "False").lower() in ('true', '1', 't')
 
 # Bounding Box de Chile
@@ -28,7 +29,7 @@ LAT_MIN, LAT_MAX = -56.5, -17.5
 LON_MIN, LON_MAX = -75.6, -66.5
 USER_AGENT = "optimizador-rutas-chile/3.4"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "http://router.project-osrm.org/table/v1/driving")
+OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
 
 DEFAULT_CONFIG_VRP: Dict[str, Any] = {
     # Tiempos de servicio por tipo de OT (en minutos)
@@ -862,17 +863,20 @@ def optimizar_jornada(
     aplicar_cambios: bool = APLICAR_CAMBIOS,
     tiempo_limite_segundos: Optional[int] = None,
     api_base_url: str = API_BASE_URL,
-    session: Optional[requests.Session] = None
+    session: Optional[requests.Session] = None,
+    tecnicos: Optional[List[Dict[str, Any]]] = None,
+    ordenes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Funcion modular para ejecutar el pipeline de optimizacion de rutas VRP."""
     client = session or requests.Session()
-    tecnicos, ordenes = obtener_datos_operativos(session=client, api_base_url=api_base_url, fecha=fecha)
+    if tecnicos is None or ordenes is None:
+        tecnicos, ordenes = obtener_datos_operativos(session=client, api_base_url=api_base_url, fecha=fecha)
     
     if not tecnicos or not ordenes:
         return {
             "status": "no_data",
             "mensaje": "Faltan tecnicos disponibles u OTs por asignar para la fecha seleccionada.",
-            "kpis": {"total_ots": len(ordenes), "asignadas": 0, "pendientes": len(ordenes)},
+            "kpis": {"total_ots": len(ordenes) if ordenes else 0, "asignadas": 0, "pendientes": len(ordenes) if ordenes else 0},
             "rutas": []
         }
         

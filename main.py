@@ -506,7 +506,7 @@ def get_geometria_ruta(coordenadas: str = Query(..., description="Coordenadas lo
     Entrada: lon1,lat1;lon2,lat2;...
     Retorna arreglo de puntos [lat, lon] listos para Leaflet.
     """
-    osrm_url = f"http://router.project-osrm.org/route/v1/driving/{coordenadas}?overview=full&geometries=geojson"
+    osrm_url = f"https://router.project-osrm.org/route/v1/driving/{coordenadas}?overview=full&geometries=geojson"
     try:
         res = requests.get(osrm_url, timeout=10)
         if res.status_code == 200:
@@ -547,12 +547,60 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     except ImportError as e:
         raise HTTPException(status_code=500, detail=f"Error importando optimizador: {e}")
 
+    target_fecha = body.fecha or date.today().isoformat()
+    
+    # Obtener técnicos disponibles y órdenes pendientes directamente en memoria
+    disp_hoy = [d for d in DB_DISPONIBILIDADES if d["fecha"] == target_fecha and d.get("disponible")]
+    ids_disponibles = {d["tecnico_id"] for d in disp_hoy}
+    tecnicos_hoy = [t for t in DB_TECNICOS if t["id"] in ids_disponibles]
+    ordenes_pendientes = [o for o in DB_ORDENES if o.get("estado") in ("por_asignar", "por_revisar")]
+
+    if not tecnicos_hoy or not ordenes_pendientes:
+        return {
+            "status": "no_data",
+            "mensaje": f"Faltan técnicos disponibles ({len(tecnicos_hoy)}) u órdenes por asignar ({len(ordenes_pendientes)}) para {target_fecha}.",
+            "kpis": {"total_ots": len(ordenes_pendientes), "asignadas": 0, "pendientes": len(ordenes_pendientes)},
+            "rutas": []
+        }
+
+    # Ejecución sin depender de llamadas HTTP a localhost (vital para Render/producción)
     resultado = optimizar_jornada(
-        fecha=body.fecha,
-        aplicar_cambios=body.aplicar_cambios,
+        fecha=target_fecha,
+        aplicar_cambios=False,
         tiempo_limite_segundos=body.tiempo_limite_segundos,
-        api_base_url="http://127.0.0.1:8000/api"
+        tecnicos=tecnicos_hoy,
+        ordenes=ordenes_pendientes
     )
+
+    if body.aplicar_cambios and resultado.get("status") == "success":
+        if target_fecha not in DB_RUTAS_PLANIFICADAS:
+            DB_RUTAS_PLANIFICADAS[target_fecha] = {}
+
+        for ruta in resultado.get("rutas", []):
+            tec_id = ruta["tecnico_id"]
+            DB_RUTAS_PLANIFICADAS[target_fecha][tec_id] = {
+                "tecnico_id": tec_id,
+                "nombre": ruta["nombre"],
+                "tipo": ruta["tipo"],
+                "zona_base": ruta["zona_base"],
+                "base_latitud": ruta.get("base_latitud"),
+                "base_longitud": ruta.get("base_longitud"),
+                "capacidad_uso": ruta.get("capacidad_uso"),
+                "hora_salida_base": ruta.get("hora_salida_base"),
+                "hora_retorno_base": ruta.get("hora_retorno_base"),
+                "duracion_total_min": ruta.get("duracion_total_min"),
+                "fecha": target_fecha,
+                "paradas": []
+            }
+            for p in ruta.get("paradas", []):
+                DB_RUTAS_PLANIFICADAS[target_fecha][tec_id]["paradas"].append(p)
+                orden = next((o for o in DB_ORDENES if o["id"] == p["ot_id"]), None)
+                if orden:
+                    orden["tecnico_id"] = tec_id
+                    orden["secuencia"] = p["secuencia"]
+                    orden["hora_estimada_llegada"] = p["hora_estimada_llegada"]
+                    orden["hora_estimada_salida"] = p["hora_estimada_salida"]
+                    orden["estado"] = "asignacion_por_confirmar"
 
     return resultado
 
@@ -633,3 +681,10 @@ def get_metricas_resumen(fecha: Optional[str] = Query(default=None)):
 # Montar archivos estaticos si existen
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Iniciando servidor en 0.0.0.0:{port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -861,7 +861,7 @@
 
       // Fallback: consulta directa a OSRM desde cliente si la API backend fallase
       try {
-        const urlDirecta = `http://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson`;
+        const urlDirecta = `https://router.project-osrm.org/route/v1/driving/${coordsStr}?overview=full&geometries=geojson`;
         const res2 = await fetch(urlDirecta);
         if (res2.ok) {
           const data2 = await res2.json();
