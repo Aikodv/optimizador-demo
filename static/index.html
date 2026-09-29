@@ -626,7 +626,7 @@
       document.getElementById('cfg-sinuosidad').value = cfg.factor_sinuosidad_vial || 1.30;
       document.getElementById('cfg-velocidad').value = cfg.velocidad_promedio_kmh || 30.0;
       document.getElementById('cfg-solver-time').value = cfg.solver_time_limit_seconds || 10;
-      document.getElementById('cfg-span-cost').value = cfg.span_cost_coefficient || 50;
+      document.getElementById('cfg-span-cost').value = cfg.span_cost_coefficient ?? 50;
 
       document.getElementById('cfg-usar-osrm').checked = cfg.usar_osrm !== false;
     }
@@ -1064,13 +1064,13 @@
         const res = await fetch(`${API_BASE}/optimizador/ejecutar`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            aplicar_cambios: false,
-            tiempo_limite_segundos: currentConfig.solver_time_limit_seconds || 10
-          })
+          body: JSON.stringify({ aplicar_cambios: false })
         });
         const result = await res.json();
-        
+        if (!res.ok || result.status !== 'success') {
+          throw new Error(result.mensaje || (result.detail && JSON.stringify(result.detail)) || `HTTP ${res.status}`);
+        }
+
         await Promise.all([
           cargarMetricas(),
           cargarOrdenes(),
@@ -1078,7 +1078,8 @@
         ]);
 
         cambiarTab('rutas');
-        mostrarToast("Optimización completada exitosamente", "fa-bolt", "text-sky-400");
+        const r = result.resumen;
+        mostrarToast(`Optimización completada: ${r.ots_asignadas}/${r.total_ots} OTs asignadas`, "fa-bolt", "text-sky-400");
       } catch (err) {
         alert("Error ejecutando optimización: " + err);
       } finally {

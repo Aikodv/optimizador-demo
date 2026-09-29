@@ -1,37 +1,54 @@
-import os
-import re
+# =============================================================================
+# Optimizador de Rutas VRP (Google OR-Tools) - Despacho de tecnicos en Chile
+# =============================================================================
+#
+# Pipeline:
+#   1. Extraccion:      tecnicos disponibles + OTs por asignar (API o parametros)
+#   2. Transformacion:  coordenadas, matrices distancia/tiempo, ventanas, sectores
+#   3. Optimizacion:    VRP con ventanas horarias, capacidad y sectores (OR-Tools)
+#   4. Resultado:       hojas de ruta, diagnostico de OTs pendientes y alertas
+#   5. Aplicacion:      (opcional) asignacion de tecnicos en la API externa
+#
+# Convencion: todas las coordenadas internas se manejan como (lat, lon).
+# =============================================================================
+
+import copy
 import json
 import math
+import os
+import re
 import time
-import copy
 import unicodedata
 from datetime import date
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
+from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
 # =============================================================================
-# CONFIGURACION CENTRALIZADA Y DINAMICA VRP
+# CONFIGURACION
 # =============================================================================
 BASE_DIR = Path(__file__).resolve().parent
 COMUNAS_JSON_PATH = BASE_DIR / "Latitud - Longitud Chile.json"
 GEOCODING_CACHE_PATH = BASE_DIR / "geocoding_cache.json"
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
-APLICAR_CAMBIOS = False
+OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+USER_AGENT = "optimizador-rutas-chile/4.0"
 
-# Bounding Box de Chile
+# Bounding box de Chile
 LAT_MIN, LAT_MAX = -56.5, -17.5
 LON_MIN, LON_MAX = -75.6, -66.5
-USER_AGENT = "optimizador-rutas-chile/3.4"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
+
+COORD_DEFAULT = (-33.4372, -70.6572)  # Santiago Centro, ultimo recurso
+MAX_NODOS_OSRM = 100                  # Limite practico del servidor publico de OSRM
+MAX_TIEMPO_SOLVER_S = 120
 
 DEFAULT_CONFIG_VRP: Dict[str, Any] = {
-    # Tiempos de servicio por tipo de OT (en minutos)
+    # Tiempos de servicio por tipo de OT (minutos)
     "tiempos_servicio_por_tipo": {
         "instalacion_simple": 45,
         "instalacion_con_corte": 90,
@@ -40,233 +57,207 @@ DEFAULT_CONFIG_VRP: Dict[str, Any] = {
     },
     "tiempo_servicio_default": 30,
 
-    # Parametros de Jornada y Horarios
-    "inicio_jornada_horas": 8,          # 08:00 AM es el minuto 0
-    "fin_jornada_minutos": 600,         # 10 horas laborales (hasta 18:00)
+    # Jornada
+    "inicio_jornada_horas": 8,          # 08:00 es el minuto 0
+    "fin_jornada_minutos": 600,         # 10 horas (hasta 18:00)
+    "ventana_tolerancia_min": 30,       # +/- minutos alrededor de la hora acordada
 
-    # Capacidades maximas por defecto
+    # Capacidad maxima de OTs por tipo de tecnico (tope; el cap_max individual puede reducirla)
     "capacidad_max_externo": 8,
     "capacidad_max_interno": 12,
 
-    # Parametros Geometricos y Viales
-    "factor_sinuosidad_vial": 1.30,      # Correccion vial urbana (1.30x)
-    "velocidad_promedio_kmh": 30.0,     # Velocidad promedio en ciudad
-    "max_radio_operacional_km": 80.0,   # Umbral de alerta para puntos distantes
+    # Geometria vial
+    "factor_sinuosidad_vial": 1.30,
+    "velocidad_promedio_kmh": 30.0,
+    "max_radio_operacional_km": 80.0,
 
-    # Costos y Penalizaciones Algoritmicas
-    "penalty_drop_node": 500_000,       # Penalizacion por descarte de OT
-    "penalty_mix_sector": 5_000_000,    # Penalizacion para evitar mezcla de sector
-    "span_cost_coefficient": 50,        # Balanceo de tiempo entre tecnicos
-    "solver_time_limit_seconds": 10,    # Tiempo limite de busqueda en segundos
+    # Costos (unidades de costo = metros)
+    # penalty_drop_node debe ser mayor que penalty_mix_sector: dejar una OT sin
+    # asignar tiene que ser peor que mezclar sectores en la ruta de un interno.
+    "penalty_drop_node": 10_000_000,
+    "penalty_mix_sector": 100_000,
+    "span_cost_coefficient": 50,
+    "costo_por_ot_externo": 0,               # >0 da preferencia general a internos (ej: 20000 = 20 km extra por OT externa)
+    # Sectores con MAS de N OTs se asignan a internos: un externo solo toma OTs ahi si a los
+    # internos no les alcanza capacidad/horario (cada una le cuesta la penalizacion). 0 = desactivado.
+    "umbral_ots_sector_interno": 10,
+    "penalty_externo_sector_interno": 1_000_000,  # < penalty_drop_node: mejor un externo que dejar la OT sin atender
+    "solver_time_limit_seconds": 10,         # minimo; se amplia automaticamente con muchas OTs (0.5 s/OT, max 120 s)
 
-    # Servicios Externos
+    # Servicios externos
     "usar_osrm": True,
     "usar_geocoding": True,
 }
 
 CONFIG_VRP: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG_VRP)
 
+
 def obtener_configuracion() -> Dict[str, Any]:
     """Retorna una copia de la configuracion actual del optimizador."""
     return copy.deepcopy(CONFIG_VRP)
 
+
 def actualizar_configuracion(nuevos_valores: Dict[str, Any]) -> Dict[str, Any]:
-    """Actualiza dinamicamente los parametros del optimizador."""
-    global CONFIG_VRP
+    """Actualiza parametros existentes del optimizador (claves desconocidas se ignoran)."""
     for k, v in nuevos_valores.items():
-        if k in CONFIG_VRP and v is not None:
-            if isinstance(CONFIG_VRP[k], dict) and isinstance(v, dict):
-                CONFIG_VRP[k].update(v)
-            else:
-                CONFIG_VRP[k] = v
-    print(f"   [CONFIG] Parametros VRP actualizados en memoria.")
+        if k not in CONFIG_VRP or v is None:
+            continue
+        if isinstance(CONFIG_VRP[k], dict) and isinstance(v, dict):
+            CONFIG_VRP[k].update(v)
+        else:
+            CONFIG_VRP[k] = v
+    print("   [CONFIG] Parametros VRP actualizados en memoria.")
     return obtener_configuracion()
+
 
 def restaurar_configuracion() -> Dict[str, Any]:
     """Restaura los parametros del optimizador a sus valores por defecto."""
     global CONFIG_VRP
     CONFIG_VRP = copy.deepcopy(DEFAULT_CONFIG_VRP)
-    print(f"   [CONFIG] Parametros VRP restaurados a valores iniciales.")
+    print("   [CONFIG] Parametros VRP restaurados a valores iniciales.")
     return obtener_configuracion()
 
 # =============================================================================
-# FUNCIONES AUXILIARES DE TIEMPO
+# UTILIDADES DE TIEMPO Y TEXTO
 # =============================================================================
-def minutos_desde_inicio(hora_str: Optional[str], inicio_horas: Optional[int] = None) -> Optional[int]:
-    """Convierte 'HH:MM' a minutos transcurridos desde el inicio de la jornada laboral."""
+def minutos_desde_inicio(hora_str: Optional[str], inicio_horas: int) -> Optional[int]:
+    """'HH:MM' -> minutos desde el inicio de jornada (puede ser negativo si es antes)."""
     if not hora_str:
         return None
     try:
-        partes = hora_str.strip().split(':')
-        h, m = int(partes[0]), int(partes[1])
-        base_h = inicio_horas if inicio_horas is not None else CONFIG_VRP.get("inicio_jornada_horas", 8)
-        minutos_totales = (h * 60 + m) - (base_h * 60)
-        return max(0, minutos_totales)
-    except (ValueError, IndexError):
+        h, m = (int(x) for x in str(hora_str).strip().split(":")[:2])
+    except ValueError:
         return None
+    return (h * 60 + m) - inicio_horas * 60
 
-def minutos_a_hora_str(minutos: int, inicio_horas: Optional[int] = None) -> str:
-    """Convierte minutos desde el inicio de la jornada a formato HH:MM."""
-    base_h = inicio_horas if inicio_horas is not None else CONFIG_VRP.get("inicio_jornada_horas", 8)
-    min_totales = (base_h * 60) + int(minutos)
-    h = (min_totales // 60) % 24
-    m = min_totales % 60
-    return f"{h:02d}:{m:02d}"
+
+def minutos_a_hora_str(minutos: int, inicio_horas: int) -> str:
+    """Minutos desde el inicio de jornada -> 'HH:MM'."""
+    total = inicio_horas * 60 + int(minutos)
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
 
 def normalizar_texto(texto: Any) -> str:
-    """Elimina tildes, convierte a minusculas y quita espacios extra para cruces exactos."""
+    """Minusculas, sin tildes ni espacios sobrantes (para cruces exactos)."""
     if not texto:
         return ""
     texto = str(texto).strip().lower()
-    texto = ''.join((c for c in unicodedata.normalize('NFD', texto) if unicodedata.category(c) != 'Mn'))
-    return texto
+    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+
+
+def coordenada_valida(lat: Any, lon: Any) -> bool:
+    """True si (lat, lon) son numeros dentro del territorio chileno."""
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return False
+    return LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
 
 # =============================================================================
-# MODULO DE GEOMETRIA, GEOCODIFICACION Y MATRICES ESPACIALES
+# COMUNAS Y GEOCODIFICACION
 # =============================================================================
+@lru_cache(maxsize=1)
+def cargar_coordenadas_comunas() -> Dict[str, Tuple[float, float, str]]:
+    """Carga (una sola vez) las comunas de Chile: nombre normalizado -> (lat, lon, nombre original)."""
+    comunas: Dict[str, Tuple[float, float, str]] = {}
+    if not COMUNAS_JSON_PATH.exists():
+        print(f"   [WARNING] Archivo '{COMUNAS_JSON_PATH.name}' no encontrado.")
+        return comunas
+    try:
+        with open(COMUNAS_JSON_PATH, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        for item in datos:
+            nombre = (item.get("Comuna") or "").strip()
+            lat = item.get("Latitud (Decimal)")
+            lon = item.get("Longitud (decimal)") or item.get("Longitud (Decimal)")
+            if nombre and lat is not None and lon is not None:
+                comunas[normalizar_texto(nombre)] = (float(lat), float(lon), nombre)
+    except (OSError, ValueError) as e:
+        print(f"   [ERROR] Fallo al procesar '{COMUNAS_JSON_PATH.name}': {e}")
+        return comunas
+
+    alias = {
+        "santiago centro": "santiago",
+        "stgo centro": "santiago",
+        "la calera": "calera",
+        "marchigue": "marchihue",
+        "llay llay": "llaillay",
+    }
+    for a, original in alias.items():
+        if original in comunas:
+            comunas[a] = comunas[original]
+    return comunas
+
+
+@lru_cache(maxsize=1)
+def _comunas_por_longitud() -> Tuple[str, ...]:
+    return tuple(sorted(cargar_coordenadas_comunas(), key=len, reverse=True))
+
+
+def extraer_comuna(texto: str) -> Optional[str]:
+    """
+    Detecta la comuna (normalizada) presente en un texto.
+    Primero por segmentos separados por coma; luego por palabra completa,
+    probando las comunas de nombre mas largo primero.
+    """
+    if not texto:
+        return None
+    comunas = cargar_coordenadas_comunas()
+    texto_norm = normalizar_texto(texto)
+    for parte in (p.strip() for p in texto_norm.split(",")):
+        if parte in comunas:
+            return parte
+    for c in _comunas_por_longitud():
+        if len(c) >= 4 and re.search(rf"\b{re.escape(c)}\b", texto_norm):
+            return c
+    return None
+
+
 def cargar_geocoding_cache() -> Dict[str, Tuple[float, float]]:
-    """Carga la cache local persistente de direcciones geocodificadas."""
     if GEOCODING_CACHE_PATH.exists():
         try:
             with open(GEOCODING_CACHE_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return {k: (float(v[0]), float(v[1])) for k, v in data.items() if isinstance(v, (list, tuple)) and len(v) == 2}
-        except Exception as e:
+            return {k: (float(v[0]), float(v[1])) for k, v in data.items()
+                    if isinstance(v, (list, tuple)) and len(v) == 2}
+        except (OSError, ValueError) as e:
             print(f"   [WARNING] Error leyendo cache de geocodificacion: {e}")
     return {}
 
+
 def guardar_geocoding_cache(cache: Dict[str, Tuple[float, float]]) -> None:
-    """Guarda en disco la cache de geocodificacion para acelerar futuras ejecuciones."""
     try:
         with open(GEOCODING_CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
-    except Exception as e:
+    except OSError as e:
         print(f"   [WARNING] No se pudo persistir cache de geocodificacion: {e}")
 
-def cargar_coordenadas_comunas() -> Dict[str, Tuple[float, float]]:
-    """Carga el JSON local de comunas de Chile de forma robusta con soporte de alias."""
-    comunas_dict = {}
-    if not COMUNAS_JSON_PATH.exists():
-        print(f"   [WARNING] Archivo '{COMUNAS_JSON_PATH}' no encontrado.")
-        return {}
-    
-    try:
-        with open(COMUNAS_JSON_PATH, "r", encoding="utf-8") as f:
-            datos = json.load(f)
-            
-        for item in datos:
-            nombre_comuna = normalizar_texto(item.get("Comuna", ""))
-            lat = item.get("Latitud (Decimal)")
-            lon = item.get("Longitud (decimal)") or item.get("Longitud (Decimal)") 
-            
-            if nombre_comuna and lat is not None and lon is not None:
-                comunas_dict[nombre_comuna] = (float(lat), float(lon))
-                
-        # Aliases comunes para comunas con nombres compuestos o abreviados
-        if "santiago" in comunas_dict:
-            comunas_dict["santiago centro"] = comunas_dict["santiago"]
-            comunas_dict["stgo centro"] = comunas_dict["santiago"]
-        if "calera" in comunas_dict:
-            comunas_dict["la calera"] = comunas_dict["calera"]
-        if "marchihue" in comunas_dict:
-            comunas_dict["marchigue"] = comunas_dict["marchihue"]
-        if "llaillay" in comunas_dict:
-            comunas_dict["llay llay"] = comunas_dict["llaillay"]
-            
-        return comunas_dict
-    except Exception as e:
-        print(f"   [ERROR] Fallo al procesar '{COMUNAS_JSON_PATH.name}': {e}")
-        return {}
-
-def extraer_comuna_direccion(direccion: str, comunas_dict: Dict[str, Tuple[float, float]]) -> Optional[str]:
-    """
-    Identifica y extrae semánticamente la comuna presente en una direccion textual.
-    Prioriza coincidencia por segmentos y luego por busqueda de subcadena ordenada por longitud.
-    """
-    if not direccion:
-        return None
-    dir_norm = normalizar_texto(direccion)
-    
-    partes = [p.strip() for p in dir_norm.split(',') if p.strip()]
-    for p in partes:
-        if p in comunas_dict:
-            return p
-            
-    comunas_ordenadas = sorted(comunas_dict.keys(), key=len, reverse=True)
-    for c in comunas_ordenadas:
-        if len(c) >= 4 and c in dir_norm:
-            return c
-            
-    return None
-
-def calcular_distancia_haversine_metros(coord1: Tuple[float, float], coord2: Tuple[float, float], aplicar_sinuosidad: bool = True) -> int:
-    """Calcula la distancia ortodromica entre dos coordenadas (lon, lat) aplicando sinuosidad vial."""
-    lon1, lat1 = coord1
-    lon2, lat2 = coord2
-    
-    if lon1 == lon2 and lat1 == lat2:
-        return 0
-
-    R = 6371000  # Radio medio de la Tierra en metros
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
-    
-    a = math.sin(delta_phi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    dist_metros = R * c
-    
-    if aplicar_sinuosidad:
-        factor = float(CONFIG_VRP.get("factor_sinuosidad_vial", 1.30))
-        dist_metros *= factor
-        
-    return int(dist_metros)
-
-def estimar_tiempo_viaje_minutos(distancia_metros: int, velocidad_kmh: Optional[float] = None) -> int:
-    """Estima el tiempo de viaje en minutos a partir de la distancia vial estimada y velocidad media."""
-    if distancia_metros <= 0:
-        return 0
-    vel = velocidad_kmh if velocidad_kmh is not None else float(CONFIG_VRP.get("velocidad_promedio_kmh", 30.0))
-    velocidad_mpm = (vel * 1000.0) / 60.0  # metros por minuto
-    minutos = distancia_metros / velocidad_mpm
-    return max(1, int(round(minutos)))
 
 def limpiar_direccion_para_geocoding(direccion: str) -> str:
-    """Remueve complementos interiores para maximizar tasa de acierto en OSM/Nominatim."""
+    """Remueve complementos interiores (depto, piso, oficina...) para mejorar el acierto en Nominatim."""
     if not direccion:
         return ""
-    patron_interior = r'(?i)\b(?:depto|dpto|departamento|piso|of|oficina|block|bloque|local|sitio|bodega|casa|edificio|torre|habitacion|habitación)\.?\s*#?\s*[a-zA-Z0-9\-]+'
+    patron_interior = (r'(?i)\b(?:depto|dpto|departamento|piso|of|oficina|block|bloque|local|sitio|'
+                       r'bodega|casa|edificio|torre|habitacion|habitación)\.?\s*#?\s*[a-zA-Z0-9\-]+')
     limpia = re.sub(patron_interior, '', direccion)
     limpia = re.sub(r'(\s*,\s*)+', ', ', limpia)
-    limpia = re.sub(r'\s+', ' ', limpia).strip(' ,')
-    return limpia
+    return re.sub(r'\s+', ' ', limpia).strip(' ,')
+
 
 def geocode_direccion(
-    direccion: str, 
+    direccion: str,
     session: Optional[requests.Session] = None,
-    max_intentos: int = 2
+    max_intentos: int = 2,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """Geocodifica una direccion mediante Nominatim con sanitizacion y reintentos con backoff."""
+    """Geocodifica una direccion con Nominatim (reintentos con backoff ante 429/errores de red)."""
     client = session or requests
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "es"}
-    
+
     dir_limpia = limpiar_direccion_para_geocoding(direccion)
-    consultas_a_probar = [dir_limpia]
-    if dir_limpia != direccion:
-        consultas_a_probar.append(direccion)
-        
-    for query in consultas_a_probar:
-        if not query:
-            continue
-            
-        params = {
-            "q": query, 
-            "format": "json", 
-            "limit": 1, 
-            "countrycodes": "cl", 
-            "addressdetails": 0
-        }
-        
+    consultas = [q for q in dict.fromkeys([dir_limpia, direccion]) if q]
+
+    for query in consultas:
+        params = {"q": query, "format": "json", "limit": 1, "countrycodes": "cl", "addressdetails": 0}
         for intento in range(1, max_intentos + 1):
             try:
                 res = client.get(NOMINATIM_URL, params=params, headers=headers, timeout=6)
@@ -275,669 +266,782 @@ def geocode_direccion(
                     print(f"   [RATE LIMIT] Nominatim 429. Reintentando en {espera}s...")
                     time.sleep(espera)
                     continue
-                    
                 res.raise_for_status()
                 data = res.json()
-                
                 if data:
                     lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
-                    if LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX:
+                    if coordenada_valida(lat, lon):
                         return lat, lon
                 break
-            except requests.RequestException as e:
+            except requests.RequestException:
                 time.sleep(1.0)
             except (KeyError, IndexError, ValueError):
                 break
-                
     return None, None
 
-def asegurar_coordenadas_ordenes(
-    ordenes: List[Dict[str, Any]], 
-    comunas_dict: Dict[str, Tuple[float, float]],
-    session: Optional[requests.Session] = None
-) -> None:
-    """Jerarquia de 4 niveles de resolucion geografica con cache local."""
+
+def resolver_coordenadas_ordenes(
+    ordenes: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    session: Optional[requests.Session] = None,
+) -> List[str]:
+    """
+    Asegura latitud/longitud en cada OT (modifica las OTs) y retorna la precision obtenida por OT:
+    original -> cache -> geocoding (Nominatim) -> comuna (centroide) -> aproximada (Santiago Centro).
+    """
+    comunas = cargar_coordenadas_comunas()
     cache = cargar_geocoding_cache()
     cache_actualizado = False
-    usar_geo = CONFIG_VRP.get("usar_geocoding", True)
-    
-    for ot in ordenes:
-        lat, lon = ot.get("latitud"), ot.get("longitud")
-        
-        if lat is not None and lon is not None:
-            if not (LAT_MIN <= float(lat) <= LAT_MAX and LON_MIN <= float(lon) <= LON_MAX):
-                ot["latitud"], ot["longitud"] = None, None
-        
-        if ot.get("latitud") is not None and ot.get("longitud") is not None:
-            continue
-            
-        direccion = ot.get("direccion_instalacion", "").strip()
-        comuna_ot = ot.get("comuna", "").strip()
-        region_ot = ot.get("region", "").strip()
-        
-        comuna_norm = normalizar_texto(comuna_ot) if comuna_ot else ""
-        if not comuna_norm:
-            comuna_detectada = extraer_comuna_direccion(direccion, comunas_dict)
-            if comuna_detectada:
-                comuna_norm = comuna_detectada
+    precisiones: List[str] = []
 
-        # Query completa: Dirección, Comuna, Región, Chile
-        partes_dir = [p for p in [direccion, comuna_ot, region_ot, "Chile"] if p]
-        direccion_completa = ", ".join(partes_dir)
-        dir_canonica = normalizar_texto(limpiar_direccion_para_geocoding(direccion_completa))
-        
-        if dir_canonica in cache:
-            lat_c, lon_c = cache[dir_canonica]
-            ot["latitud"], ot["longitud"] = lat_c, lon_c
+    for ot in ordenes:
+        if coordenada_valida(ot.get("latitud"), ot.get("longitud")):
+            ot["latitud"], ot["longitud"] = float(ot["latitud"]), float(ot["longitud"])
+            precisiones.append("original")
             continue
-            
-        if usar_geo:
-            lat_geo, lon_geo = geocode_direccion(direccion_completa, session=session)
-            if lat_geo is not None and lon_geo is not None:
-                ot["latitud"], ot["longitud"] = lat_geo, lon_geo
-                cache[dir_canonica] = (lat_geo, lon_geo)
+
+        direccion = (ot.get("direccion_instalacion") or "").strip()
+        comuna_ot = (ot.get("comuna") or "").strip()
+        region_ot = (ot.get("region") or "").strip()
+
+        consulta = ", ".join(p for p in [direccion, comuna_ot, region_ot, "Chile"] if p)
+        clave_cache = normalizar_texto(limpiar_direccion_para_geocoding(consulta))
+
+        if clave_cache in cache:
+            ot["latitud"], ot["longitud"] = cache[clave_cache]
+            precisiones.append("cache")
+            continue
+
+        if cfg.get("usar_geocoding", True) and direccion:
+            lat, lon = geocode_direccion(consulta, session=session)
+            time.sleep(1.0)  # Politica de uso de Nominatim: max 1 req/s (tambien tras fallos)
+            if lat is not None and lon is not None:
+                ot["latitud"], ot["longitud"] = lat, lon
+                cache[clave_cache] = (lat, lon)
                 cache_actualizado = True
-                time.sleep(1.0)
+                precisiones.append("geocoding")
                 continue
-                
-        # Centroide comunal exacto usando comuna_norm
-        if comuna_norm and comuna_norm in comunas_dict:
-            lat_com, lon_com = comunas_dict[comuna_norm]
-            ot["latitud"], ot["longitud"] = lat_com, lon_com
+
+        comuna = normalizar_texto(comuna_ot)
+        if comuna not in comunas:
+            comuna = extraer_comuna(direccion)
+        if comuna:
+            ot["latitud"], ot["longitud"] = comunas[comuna][:2]
+            precisiones.append("comuna")
         else:
-            ot["latitud"], ot["longitud"] = -33.4372, -70.6572
+            ot["latitud"], ot["longitud"] = COORD_DEFAULT
+            precisiones.append("aproximada")
 
     if cache_actualizado:
         guardar_geocoding_cache(cache)
+    return precisiones
 
-def generar_matrices_haversine(coords_nodos: List[Tuple[float, float]]) -> Tuple[List[List[int]], List[List[int]]]:
-    """Genera matrices de distancia y tiempo utilizando formula Haversine con factor de sinuosidad vial."""
-    num_nodos = len(coords_nodos)
-    matriz_distancias = [[0] * num_nodos for _ in range(num_nodos)]
-    matriz_tiempos = [[0] * num_nodos for _ in range(num_nodos)]
-    
-    for i in range(num_nodos):
-        for j in range(num_nodos):
+
+def resolver_base_tecnico(tecnico: Dict[str, Any]) -> Tuple[Tuple[float, float], str]:
+    """Coordenadas de la base de un tecnico: explicitas -> centroide de su zona/comuna -> Santiago Centro."""
+    for k_lat, k_lon in (("base_latitud", "base_longitud"), ("latitud", "longitud")):
+        if coordenada_valida(tecnico.get(k_lat), tecnico.get(k_lon)):
+            return (float(tecnico[k_lat]), float(tecnico[k_lon])), "original"
+    comuna = extraer_comuna(tecnico.get("zona") or "")
+    if comuna:
+        return cargar_coordenadas_comunas()[comuna][:2], "comuna"
+    return COORD_DEFAULT, "aproximada"
+
+
+def sector_de_orden(ot: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Retorna (clave normalizada del sector, nombre para mostrar). Clave None si no se reconoce."""
+    comunas = cargar_coordenadas_comunas()
+    comuna_ot = (ot.get("comuna") or "").strip()
+    clave = normalizar_texto(comuna_ot) if comuna_ot else None
+    if not clave or clave not in comunas:
+        clave = extraer_comuna(ot.get("direccion_instalacion") or "") or clave
+    if not clave:
+        return None, "Sin sector"
+    nombre = comunas[clave][2] if clave in comunas else comuna_ot
+    return clave, nombre
+
+# =============================================================================
+# MATRICES DE DISTANCIA Y TIEMPO
+# =============================================================================
+def distancia_haversine_metros(p1: Tuple[float, float], p2: Tuple[float, float], factor: float = 1.0) -> int:
+    """Distancia ortodromica entre (lat, lon) en metros, multiplicada por un factor de sinuosidad."""
+    lat1, lon1 = p1
+    lat2, lon2 = p2
+    if lat1 == lat2 and lon1 == lon2:
+        return 0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return int(6_371_000 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a)) * factor)
+
+
+def estimar_tiempo_viaje_minutos(distancia_metros: int, velocidad_kmh: float) -> int:
+    if distancia_metros <= 0:
+        return 0
+    return max(1, int(round(distancia_metros / (velocidad_kmh * 1000.0 / 60.0))))
+
+
+def generar_matrices_haversine(coords: List[Tuple[float, float]], cfg: Dict[str, Any]) -> Tuple[List[List[int]], List[List[int]]]:
+    factor = float(cfg.get("factor_sinuosidad_vial", 1.30))
+    velocidad = float(cfg.get("velocidad_promedio_kmh", 30.0))
+    n = len(coords)
+    dist = [[0] * n for _ in range(n)]
+    tiempo = [[0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
             if i != j:
-                dist = calcular_distancia_haversine_metros(coords_nodos[i], coords_nodos[j], aplicar_sinuosidad=True)
-                matriz_distancias[i][j] = dist
-                matriz_tiempos[i][j] = estimar_tiempo_viaje_minutos(dist)
-                
-    return matriz_distancias, matriz_tiempos
+                d = distancia_haversine_metros(coords[i], coords[j], factor)
+                dist[i][j] = d
+                tiempo[i][j] = estimar_tiempo_viaje_minutos(d, velocidad)
+    return dist, tiempo
 
-def obtener_matrices_osrm(coords_nodos: List[Tuple[float, float]], session: Optional[requests.Session] = None) -> Tuple[List[List[int]], List[List[int]]]:
-    """Obtiene la matriz de distancias y tiempos de OSRM con fallback determinista a Haversine sinuoso."""
-    num_nodos = len(coords_nodos)
-    coords_str = ";".join([f"{lon},{lat}" for lon, lat in coords_nodos])
-    print(f"   [INFO] Solicitando matriz a OSRM para {num_nodos} puntos...")
-    
+
+def obtener_matrices_osrm(
+    coords: List[Tuple[float, float]],
+    cfg: Dict[str, Any],
+    session: Optional[requests.Session] = None,
+) -> Tuple[List[List[int]], List[List[int]], str]:
+    """Matrices desde OSRM; las celdas sin ruta (o todo, si OSRM falla) se completan con Haversine."""
+    dist, tiempo = generar_matrices_haversine(coords, cfg)
+    coords_str = ";".join(f"{lon},{lat}" for lat, lon in coords)
+    print(f"   [INFO] Solicitando matriz a OSRM para {len(coords)} puntos...")
     client = session or requests
-    url = f"{OSRM_TABLE_URL}/{coords_str}?annotations=distance,duration"
     try:
-        response = client.get(url, timeout=15).json()
-        if response.get('code') == 'Ok':
-            matriz_tiempos = [[max(1, int(round(val / 60.0))) if i != j else 0 for j, val in enumerate(row)] for i, row in enumerate(response['durations'])]
-            matriz_distancias = [[int(round(val)) for val in row] for row in response['distances']]
-            return matriz_distancias, matriz_tiempos
-    except Exception:
-        pass
-        
-    return generar_matrices_haversine(coords_nodos)
+        res = client.get(f"{OSRM_TABLE_URL}/{coords_str}", params={"annotations": "distance,duration"}, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        if data.get("code") == "Ok":
+            for i, (fila_t, fila_d) in enumerate(zip(data["durations"], data["distances"])):
+                for j, (t, d) in enumerate(zip(fila_t, fila_d)):
+                    if i != j and t is not None and d is not None:
+                        tiempo[i][j] = max(1, int(round(t / 60.0)))
+                        dist[i][j] = int(round(d))
+            return dist, tiempo, "osrm"
+        print(f"   [WARNING] OSRM respondio code={data.get('code')}; usando Haversine.")
+    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+        print(f"   [WARNING] OSRM no disponible ({e}); usando Haversine.")
+    return dist, tiempo, "haversine"
 
-def validar_radio_operacional(coords_bases: List[Tuple[float, float]], coords_ots: List[Tuple[float, float]], ordenes: List[Dict[str, Any]]) -> None:
-    """Verifica si existen OTs ubicadas a distancias desproporcionadas respecto a la base de la flota."""
-    if not coords_bases or not coords_ots:
-        return
-        
-    centroide_base = (
-        sum(p[0] for p in coords_bases) / len(coords_bases),
-        sum(p[1] for p in coords_bases) / len(coords_bases)
-    )
-    max_radio = float(CONFIG_VRP.get("max_radio_operacional_km", 80.0))
-    
-    for i, p_ot in enumerate(coords_ots):
-        dist_km = calcular_distancia_haversine_metros(centroide_base, p_ot, aplicar_sinuosidad=False) / 1000.0
+
+def alertas_radio_operacional(
+    coords_bases: List[Tuple[float, float]],
+    coords_ots: List[Tuple[float, float]],
+    ordenes: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> List[str]:
+    """Alertas de OTs demasiado lejos del centroide de las bases de la flota."""
+    if not coords_bases:
+        return []
+    centroide = (sum(p[0] for p in coords_bases) / len(coords_bases),
+                 sum(p[1] for p in coords_bases) / len(coords_bases))
+    max_radio = float(cfg.get("max_radio_operacional_km", 80.0))
+    alertas = []
+    for ot, p in zip(ordenes, coords_ots):
+        dist_km = distancia_haversine_metros(centroide, p) / 1000.0
         if dist_km > max_radio:
-            ot_id = ordenes[i].get('id', f'Nodo-{i}')
-            print(f"   [GEOMETRY ALERT] OT {ot_id} esta a {dist_km:.1f} km del centroide de flota (supera radio de {max_radio} km).")
+            alertas.append(f"OT {ot.get('id')}: esta a {dist_km:.1f} km del centroide de la flota (radio maximo {max_radio:.0f} km).")
+    return alertas
 
 # =============================================================================
 # 1. EXTRACCION (API) - SOLO LECTURA
 # =============================================================================
-def obtener_datos_operativos(
-    session: Optional[requests.Session] = None,
-    api_base_url: str = API_BASE_URL,
-    fecha: Optional[str] = None
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Descarga los datos operativos desde la API."""
-    print("1. Consumiendo API externa (LECTURA SOLAMENTE)...")
-    client = session or requests
-    try:
-        res_tec = client.get(f"{api_base_url}/tecnicos", timeout=25)
-        res_tec.raise_for_status()
-        tecnicos_req = res_tec.json()
+def _get_json(client: Any, url: str, params: Optional[Dict[str, str]] = None) -> Any:
+    res = client.get(url, params=params, timeout=25)
+    res.raise_for_status()
+    return res.json()
 
-        res_ord = client.get(f"{api_base_url}/ordenes?estado=por_asignar", timeout=25)
-        res_ord.raise_for_status()
-        ordenes_pendientes = res_ord.json()
 
-        target_fecha = fecha
-        if not target_fecha and ordenes_pendientes:
-            fechas_ord = [o.get("fecha_programada") for o in ordenes_pendientes if o.get("fecha_programada")]
-            if fechas_ord:
-                target_fecha = fechas_ord[0]
+def obtener_ordenes_pendientes(client: Any, api_base_url: str, fecha: Optional[str]) -> List[Dict[str, Any]]:
+    """OTs 'por_asignar'. Con fecha, solo las programadas para ese dia (o sin fecha programada)."""
+    ordenes = _get_json(client, f"{api_base_url}/ordenes", {"estado": "por_asignar"})
+    if fecha:
+        ordenes = [o for o in ordenes if not o.get("fecha_programada") or o["fecha_programada"] == fecha]
+    return ordenes
 
-        target_fecha = target_fecha or date.today().isoformat()
-        
-        res_disp = client.get(f"{api_base_url}/disponibilidad?fecha={target_fecha}", timeout=25)
-        res_disp.raise_for_status()
-        disp_req = res_disp.json()
-        
-        ids_disponibles = {d["tecnico_id"] for d in disp_req if d.get("disponible")}
-        tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
 
-        # Fallback 1: Si no hay técnicos para la fecha dada, buscar en la fecha programada de las órdenes
-        if not tecnicos_hoy and ordenes_pendientes:
-            fechas_ord = [o.get("fecha_programada") for o in ordenes_pendientes if o.get("fecha_programada")]
-            if fechas_ord and fechas_ord[0] != target_fecha:
-                nueva_fecha = fechas_ord[0]
-                try:
-                    res_disp2 = client.get(f"{api_base_url}/disponibilidad?fecha={nueva_fecha}", timeout=25)
-                    if res_disp2.status_code == 200:
-                        disp_req2 = res_disp2.json()
-                        ids_disp2 = {d["tecnico_id"] for d in disp_req2 if d.get("disponible")}
-                        if ids_disp2:
-                            target_fecha = nueva_fecha
-                            ids_disponibles = ids_disp2
-                            tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
-                except Exception:
-                    pass
+def inferir_fecha(ordenes: List[Dict[str, Any]]) -> str:
+    """Fecha programada mas temprana entre las OTs, o hoy."""
+    fechas = sorted({o["fecha_programada"] for o in ordenes if o.get("fecha_programada")})
+    return fechas[0] if fechas else date.today().isoformat()
 
-        # Fallback 2: buscar en disponibilidad general
-        if not tecnicos_hoy:
-            try:
-                res_disp_all = client.get(f"{api_base_url}/disponibilidad", timeout=25)
-                if res_disp_all.status_code == 200:
-                    all_disp = res_disp_all.json()
-                    fechas_disp = sorted(list({d["fecha"] for d in all_disp if d.get("disponible")}))
-                    if fechas_disp:
-                        target_fecha = fechas_disp[0]
-                        ids_disponibles = {d["tecnico_id"] for d in all_disp if d.get("disponible") and d.get("fecha") == target_fecha}
-                        tecnicos_hoy = [t for t in tecnicos_req if t["id"] in ids_disponibles]
-            except Exception:
-                pass
-        
-        print(f"   [RESUMEN] {len(tecnicos_hoy)} tecnicos disponibles | {len(ordenes_pendientes)} OTs pendientes (Fecha: {target_fecha})")
-        return tecnicos_hoy, ordenes_pendientes
-    except Exception as e:
-        print(f"   [ERROR FATAL] Conexion a API: {e}")
-        return [], []
+
+def obtener_tecnicos_disponibles(
+    client: Any,
+    api_base_url: str,
+    fecha: str,
+    permitir_otra_fecha: bool,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """
+    Tecnicos con disponibilidad para la fecha. Si no hay y se permite (fecha no indicada
+    explicitamente), usa la primera fecha con disponibilidad desde esa fecha en adelante.
+    """
+    tecnicos = _get_json(client, f"{api_base_url}/tecnicos")
+    disp = _get_json(client, f"{api_base_url}/disponibilidad", {"fecha": fecha})
+    ids = {d["tecnico_id"] for d in disp if d.get("disponible") and d.get("fecha", fecha) == fecha}
+
+    if not ids and permitir_otra_fecha:
+        todas = _get_json(client, f"{api_base_url}/disponibilidad")
+        fechas = sorted({d["fecha"] for d in todas if d.get("disponible") and d.get("fecha")})
+        candidatas = [f for f in fechas if f >= fecha] or fechas
+        if candidatas:
+            print(f"   [WARNING] Sin tecnicos disponibles el {fecha}; se usa {candidatas[0]}.")
+            fecha = candidatas[0]
+            ids = {d["tecnico_id"] for d in todas if d.get("disponible") and d.get("fecha") == fecha}
+
+    return [t for t in tecnicos if t.get("id") in ids], fecha
 
 # =============================================================================
 # 2. TRANSFORMACION (MODELO DE DATOS VRP)
 # =============================================================================
-def preparar_modelo_datos(tecnicos: List[Dict[str, Any]], ordenes: List[Dict[str, Any]], session: Optional[requests.Session] = None) -> Dict[str, Any]:
-    """Construye el modelo de datos unificado para Google OR-Tools utilizando CONFIG_VRP."""
+def preparar_modelo_datos(
+    tecnicos: List[Dict[str, Any]],
+    ordenes: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Construye el modelo de datos para OR-Tools. Nodos: [bases de tecnicos..., OTs...]."""
     print("\n2. Transformando datos para el modelo VRP...")
-    data = {}
-    data['num_vehicles'] = len(tecnicos)
-    V = data['num_vehicles']
+    V = len(tecnicos)
+    alertas: List[str] = []
 
-    coords_bases: List[Tuple[float, float]] = []
-    coords_ots: List[Tuple[float, float]] = []
-    
-    diccionario_comunas = cargar_coordenadas_comunas()
-
+    # Bases de tecnicos
+    coords_bases = []
     for t in tecnicos:
-        zona_original = t.get('zona', '')
-        zona_norm = normalizar_texto(zona_original)
-        lat, lon = None, None
-        
-        if zona_norm in diccionario_comunas:
-            lat, lon = diccionario_comunas[zona_norm]
-        else:
-            comuna_detectada = extraer_comuna_direccion(zona_original, diccionario_comunas)
-            if comuna_detectada and comuna_detectada in diccionario_comunas:
-                lat, lon = diccionario_comunas[comuna_detectada]
-            else:
-                lat, lon = -33.4372, -70.6572
-            
-        coords_bases.append((lon, lat))
+        coord, precision = resolver_base_tecnico(t)
+        if precision == "aproximada":
+            alertas.append(f"Tecnico {t.get('id')}: zona '{t.get('zona')}' no reconocida; se usa Santiago Centro como base.")
+        coords_bases.append(coord)
 
-    if CONFIG_VRP.get("usar_geocoding", True):
-        asegurar_coordenadas_ordenes(ordenes, comunas_dict=diccionario_comunas, session=session)
+    # Ubicacion de OTs
+    precisiones = resolver_coordenadas_ordenes(ordenes, cfg, session)
+    for ot, precision in zip(ordenes, precisiones):
+        if precision == "aproximada":
+            alertas.append(f"OT {ot.get('id')}: ubicacion no resuelta; se usa Santiago Centro (ruta poco confiable).")
+    coords_ots = [(ot["latitud"], ot["longitud"]) for ot in ordenes]
+    alertas += alertas_radio_operacional(coords_bases, coords_ots, ordenes, cfg)
 
-    for ot in ordenes:
-        lat, lon = ot.get('latitud'), ot.get('longitud')
-        if lat is None or lon is None:
-            lat, lon = -33.4372, -70.6572
-        coords_ots.append((float(lon), float(lat)))
-
-    validar_radio_operacional(coords_bases, coords_ots, ordenes)
-
-    coords_nodos = coords_bases + coords_ots
-    data['starts'] = list(range(V))
-    data['ends'] = list(range(V))
-    data['coords_bases'] = coords_bases
-    data['coords_ots'] = coords_ots
-    num_nodos = len(coords_nodos)
-
-    # Matrices de Distancia y Tiempo
-    usar_osrm = CONFIG_VRP.get("usar_osrm", True)
-    if usar_osrm and num_nodos <= 100:
-        data['distance_matrix'], data['time_matrix'] = obtener_matrices_osrm(coords_nodos, session=session)
+    # Matrices
+    coords = coords_bases + coords_ots
+    if cfg.get("usar_osrm", True) and len(coords) <= MAX_NODOS_OSRM:
+        dist, tiempo, fuente = obtener_matrices_osrm(coords, cfg, session)
     else:
-        data['distance_matrix'], data['time_matrix'] = generar_matrices_haversine(coords_nodos)
+        dist, tiempo = generar_matrices_haversine(coords, cfg)
+        fuente = "haversine"
 
-    # Tiempos de Servicio
-    tiempos_servicio_cfg = CONFIG_VRP.get("tiempos_servicio_por_tipo", {})
-    st_default = CONFIG_VRP.get("tiempo_servicio_default", 30)
-    service_times = [0] * V
-    for ot in ordenes:
-        tipo_ot = ot.get('tipo', '')
-        st = tiempos_servicio_cfg.get(tipo_ot, st_default)
-        service_times.append(st)
-    data['service_times'] = service_times
+    # Tiempos de servicio
+    tiempos_cfg = cfg.get("tiempos_servicio_por_tipo", {})
+    st_default = int(cfg.get("tiempo_servicio_default", 30))
+    service_times = [0] * V + [int(tiempos_cfg.get(ot.get("tipo"), st_default)) for ot in ordenes]
 
-    # Demandas y Capacidades
-    data['demands'] = [0] * V + [1] * len(ordenes)
-    
-    cap_ext = int(CONFIG_VRP.get("capacidad_max_externo", 8))
-    cap_int = int(CONFIG_VRP.get("capacidad_max_interno", 12))
+    # Capacidades: la configuracion es el tope por tipo; cap_max individual solo lo reduce
+    cap_ext = int(cfg.get("capacidad_max_externo", 8))
+    cap_int = int(cfg.get("capacidad_max_interno", 12))
     capacidades = []
     for t in tecnicos:
-        cap_custom = t.get('cap_max') or t.get('capacidad')
-        if cap_custom is not None:
-            capacidades.append(int(cap_custom))
-        elif t.get('tipo') == 'externo':
-            capacidades.append(cap_ext)
-        else:
-            capacidades.append(cap_int)
-    data['vehicle_capacities'] = capacidades
-    data['tecnicos_info'] = [{'id': t.get('id'), 'nombre': t.get('nombre'), 'tipo': t.get('tipo'), 'zona': t.get('zona')} for t in tecnicos]
+        cap_tipo = cap_ext if t.get("tipo") == "externo" else cap_int
+        cap_custom = t.get("cap_max") or t.get("capacidad")
+        capacidades.append(min(int(cap_custom), cap_tipo) if cap_custom is not None else cap_tipo)
 
-    # Deteccion Semantica de Sectores
-    def sector_de_orden(ot: Dict[str, Any]) -> str:
-        if ot.get('comuna'):
-            return ot['comuna'].strip().title()
-        dir_inst = ot.get('direccion_instalacion', '')
-        comuna = extraer_comuna_direccion(dir_inst, diccionario_comunas)
-        if comuna:
-            return comuna.title()
-        partes = [p.strip() for p in dir_inst.split(',') if p.strip()]
-        return partes[-2].title() if len(partes) >= 2 else f"Desconocido-{ot.get('id', 'x')}"
+    # Sectores
+    sectores = [sector_de_orden(ot) for ot in ordenes]
+    sector_counts: Dict[str, int] = {}
+    for clave, _ in sectores:
+        if clave:
+            sector_counts[clave] = sector_counts.get(clave, 0) + 1
 
-    data['orden_sectores'] = [sector_de_orden(ot) for ot in ordenes]
-    data['sector_counts'] = {}
-    for sec in data['orden_sectores']:
-        data['sector_counts'][sec] = data['sector_counts'].get(sec, 0) + 1
+    # Sectores de alta concentracion (> umbral OTs): deben ser atendidos por internos
+    umbral = int(cfg.get("umbral_ots_sector_interno", 10))
+    sectores_internos = {s for s, c in sector_counts.items() if c > umbral} if umbral > 0 else set()
+    if sectores_internos and not any(t.get("tipo") == "interno" for t in tecnicos):
+        nombres = sorted({nombre for clave, nombre in sectores if clave in sectores_internos})
+        alertas.append(f"Sectores con mas de {umbral} OTs sin tecnicos internos disponibles: {', '.join(nombres)}. Los atienden externos.")
+        sectores_internos = set()
 
-    # Ventanas Temporales
-    fin_jornada = int(CONFIG_VRP.get("fin_jornada_minutos", 600))
-    inicio_h = int(CONFIG_VRP.get("inicio_jornada_horas", 8))
-    data['time_windows'] = [(0, fin_jornada)] * V
-    
+    # Ventanas horarias (y OTs imposibles de rutear, que se excluyen del modelo)
+    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
+    inicio_h = int(cfg.get("inicio_jornada_horas", 8))
+    tolerancia = int(cfg.get("ventana_tolerancia_min", 30))
+    time_windows: List[Tuple[int, int]] = [(0, fin_jornada)] * V
+    no_ruteables: Dict[int, str] = {}
+
     for i, ot in enumerate(ordenes):
-        st = data['service_times'][V + i]
-        minuto_prog = minutos_desde_inicio(ot.get('hora_programada'), inicio_horas=inicio_h)
-        if minuto_prog is not None:
-            inicio_v = max(0, minuto_prog - 30)
-            fin_v = min(fin_jornada - st, minuto_prog + 30)
-            fin_v = max(inicio_v, fin_v)
-            data['time_windows'].append((inicio_v, fin_v))
-        else:
-            data['time_windows'].append((0, max(0, fin_jornada - st)))
+        st = service_times[V + i]
+        ultima_hora_inicio = fin_jornada - st
+        if ultima_hora_inicio < 0:
+            no_ruteables[i] = f"DURACION: el servicio ({st} min) excede la jornada completa ({fin_jornada} min)."
+            time_windows.append((0, 0))
+            continue
 
-    return data
+        prog = minutos_desde_inicio(ot.get("hora_programada"), inicio_h)
+        if prog is None:
+            time_windows.append((0, ultima_hora_inicio))
+            continue
+
+        inicio_v = max(0, prog - tolerancia)
+        fin_v = min(ultima_hora_inicio, prog + tolerancia)
+        if fin_v < inicio_v:
+            no_ruteables[i] = (
+                f"HORARIO: hora programada {ot.get('hora_programada')} fuera de la jornada "
+                f"({minutos_a_hora_str(0, inicio_h)}-{minutos_a_hora_str(ultima_hora_inicio, inicio_h)} "
+                f"como ultimo inicio para {st} min de servicio)."
+            )
+            time_windows.append((0, ultima_hora_inicio))
+        else:
+            time_windows.append((inicio_v, fin_v))
+
+    return {
+        "num_vehicles": V,
+        "starts": list(range(V)),
+        "ends": list(range(V)),
+        "coords_bases": coords_bases,
+        "distance_matrix": dist,
+        "time_matrix": tiempo,
+        "fuente_matriz": fuente,
+        "service_times": service_times,
+        "demands": [0] * V + [1] * len(ordenes),
+        "vehicle_capacities": capacidades,
+        "tipos_tecnico": [t.get("tipo") for t in tecnicos],
+        "orden_sectores": [clave for clave, _ in sectores],
+        "orden_sectores_nombre": [nombre for _, nombre in sectores],
+        "sector_counts": sector_counts,
+        "sectores_internos": sectores_internos,
+        "time_windows": time_windows,
+        "no_ruteables": no_ruteables,
+        "precisiones": precisiones,
+        "alertas": alertas,
+    }
 
 # =============================================================================
 # 3. MOTOR DE OPTIMIZACION VRP (OR-TOOLS)
 # =============================================================================
-def resolver_rutas(
-    data: Dict[str, Any], 
-    tecnicos: List[Dict[str, Any]],
-    tiempo_limite_segundos: Optional[int] = None
-) -> Tuple[pywrapcp.RoutingIndexManager, pywrapcp.RoutingModel, Any]:
-    """Configura y resuelve el modelo VRP con penalizaciones y limites configurables."""
-    print("\n3. Ejecutando motor de optimizacion OR-Tools...")
-    
-    manager = pywrapcp.RoutingIndexManager(
-        len(data['distance_matrix']), 
-        data['num_vehicles'], 
-        data['starts'], 
-        data['ends']
-    )
+def calcular_matrices_costo(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, List[List[int]]]:
+    """
+    Matrices de costo por tipo de tecnico (unidades = metros):
+      - internos: + penalty_mix_sector al pasar entre OTs de sectores distintos
+      - externos: + costo_por_ot_externo por OT atendida
+                  + penalty_externo_sector_interno por OT de un sector reservado a internos
+    """
+    V = data["num_vehicles"]
+    dist = data["distance_matrix"]
+    n = len(dist)
+    sectores = data["orden_sectores"]
+    matrices = {"base": dist, "interno": dist, "externo": dist}
+
+    penalty_mix = int(cfg.get("penalty_mix_sector", 100_000))
+    if penalty_mix > 0:
+        internos = [fila[:] for fila in dist]
+        for i in range(V, n):
+            for j in range(V, n):
+                si, sj = sectores[i - V], sectores[j - V]
+                if i != j and si and sj and si != sj:
+                    internos[i][j] += penalty_mix
+        matrices["interno"] = internos
+
+    costo_ot_externo = int(cfg.get("costo_por_ot_externo", 0))
+    penalty_ext_sector = int(cfg.get("penalty_externo_sector_interno", 1_000_000))
+    if costo_ot_externo > 0 or data["sectores_internos"]:
+        extra = [0] * V + [costo_ot_externo + (penalty_ext_sector if s in data["sectores_internos"] else 0)
+                           for s in sectores]
+        matrices["externo"] = [[d + extra[j] for j, d in enumerate(fila)] for fila in dist]
+    return matrices
+
+
+def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[str, List[List[int]]]):
+    """Crea el modelo de ruteo: costos por tipo, tiempo con ventanas, capacidad y descarte penalizado."""
+    V = data["num_vehicles"]
+    n = len(data["distance_matrix"])
+    manager = pywrapcp.RoutingIndexManager(n, V, data["starts"], data["ends"])
     routing = pywrapcp.RoutingModel(manager)
-    V = data['num_vehicles']
 
-    penalty_mix = int(CONFIG_VRP.get("penalty_mix_sector", 5_000_000))
-    penalty_drop = int(CONFIG_VRP.get("penalty_drop_node", 500_000))
-    span_coeff = int(CONFIG_VRP.get("span_cost_coefficient", 50))
-    fin_jornada = int(CONFIG_VRP.get("fin_jornada_minutos", 600))
-    time_limit = tiempo_limite_segundos or int(CONFIG_VRP.get("solver_time_limit_seconds", 10))
+    penalty_drop = int(cfg.get("penalty_drop_node", 10_000_000))
+    span_coeff = int(cfg.get("span_cost_coefficient", 50))
+    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
 
-    # Evaluador de Costos de Arco
-    def crear_callback_distancia(vehicle_id: int):
-        def callback(from_index: int, to_index: int) -> int:
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            costo_base = data['distance_matrix'][from_node][to_node]
-            tecnico = data['tecnicos_info'][vehicle_id]
-            
-            if from_node >= V and to_node >= V:
-                if tecnico.get('tipo') == 'interno':
-                    sector_from = data['orden_sectores'][from_node - V]
-                    sector_to = data['orden_sectores'][to_node - V]
-                    if sector_from != sector_to:
-                        return costo_base + penalty_mix
-            
-            return costo_base
-        return callback
+    # Matrices registradas en C++ (RegisterTransitMatrix): el solver no llama a Python por cada arco,
+    # lo que multiplica las iteraciones de busqueda en el mismo tiempo.
+    callbacks = {}
+    for v, tipo in enumerate(data["tipos_tecnico"]):
+        clave = tipo if tipo in ("interno", "externo") else "base"
+        if clave not in callbacks:
+            callbacks[clave] = routing.RegisterTransitMatrix(matrices[clave])
+        routing.SetArcCostEvaluatorOfVehicle(callbacks[clave], v)
 
-    for vehicle_id in range(V):
-        callback_idx = routing.RegisterTransitCallback(crear_callback_distancia(vehicle_id))
-        routing.SetArcCostEvaluatorOfVehicle(callback_idx, vehicle_id)
-
-    # Dimension de Tiempo
-    def time_transit_callback(from_index: int, to_index: int) -> int:
-        from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        tiempo_viaje = data['time_matrix'][from_node][to_node]
-        tiempo_servicio = data['service_times'][from_node]
-        return tiempo_viaje + tiempo_servicio
-    
-    time_callback_idx = routing.RegisterTransitCallback(time_transit_callback)
-    time_dimension_name = 'Time'
-    routing.AddDimension(
-        time_callback_idx,
-        fin_jornada,
-        fin_jornada,
-        False,
-        time_dimension_name
-    )
-    time_dimension = routing.GetDimensionOrDie(time_dimension_name)
-
+    # Dimension de tiempo: viaje + servicio en el nodo de origen
+    tiempo, st = data["time_matrix"], data["service_times"]
+    cb_tiempo = routing.RegisterTransitMatrix([[tiempo[i][j] + st[i] for j in range(n)] for i in range(n)])
+    routing.AddDimension(cb_tiempo, fin_jornada, fin_jornada, False, "Time")
+    time_dim = routing.GetDimensionOrDie("Time")
     if span_coeff > 0:
-        time_dimension.SetGlobalSpanCostCoefficient(span_coeff)
+        time_dim.SetGlobalSpanCostCoefficient(span_coeff)
 
-    for node_idx, time_window in enumerate(data['time_windows']):
-        if node_idx in data['starts'] or node_idx in data['ends']:
-            continue
-        index = manager.NodeToIndex(node_idx)
-        time_dimension.CumulVar(index).SetRange(time_window[0], time_window[1])
+    # Horarios concretos: costo minimo (1 por minuto) a la hora de termino para que las rutas
+    # terminen lo antes posible en vez de "flotar" hacia el final de la jornada. El span cost
+    # (fin - inicio) hace que, con ese termino, la salida sea lo mas tarde posible (sin esperas).
+    for v in range(V):
+        time_dim.SetCumulVarSoftUpperBound(routing.End(v), 0, 1)
+
+    # Ventanas horarias y descarte penalizado
+    for node in range(V, n):
+        index = manager.NodeToIndex(node)
         routing.AddDisjunction([index], penalty_drop)
+        if (node - V) in data["no_ruteables"]:
+            routing.ActiveVar(index).SetValue(0)
+            continue
+        ini, fin = data["time_windows"][node]
+        time_dim.CumulVar(index).SetRange(ini, fin)
 
-    # Dimension de Capacidad
-    def demand_callback(from_index: int) -> int:
-        return data['demands'][manager.IndexToNode(from_index)]
-    
-    demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-    routing.AddDimensionWithVehicleCapacity(
-        demand_callback_index, 0, data['vehicle_capacities'], True, 'Capacity'
-    )
+    # Capacidad (cantidad de OTs por tecnico)
+    cb_demanda = routing.RegisterUnaryTransitVector(data["demands"])
+    routing.AddDimensionWithVehicleCapacity(cb_demanda, 0, data["vehicle_capacities"], True, "Capacity")
+    return manager, routing
 
-    # Restricciones de Sector (>= 10 OTs)
-    internal_vehicles = [idx for idx, t in enumerate(tecnicos) if t.get('tipo') == 'interno']
-    external_vehicles = [idx for idx, t in enumerate(tecnicos) if t.get('tipo') == 'externo']
-    
-    for i, sector in enumerate(data['orden_sectores']):
-        node_idx = V + i
-        if data['sector_counts'].get(sector, 0) >= 10:
-            if internal_vehicles:
-                index = manager.NodeToIndex(node_idx)
-                for ext_v in external_vehicles:
-                    routing.VehicleVar(index).RemoveValue(ext_v)
 
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-    search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_parameters.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_parameters.time_limit.FromSeconds(time_limit)
-    search_parameters.log_search = False
+# Ninguna estrategia inicial domina en todos los tamanos de problema (medido con datos reales y
+# sinteticos de 18 a 100 OTs): se prueban ambas repartiendo el tiempo y se conserva la mejor.
+ESTRATEGIAS_INICIALES = ("PATH_CHEAPEST_ARC", "PARALLEL_CHEAPEST_INSERTION")
 
-    print(f"   [PROCESS] Resolviendo modelo VRP (limite: {time_limit}s)...")
-    solution = routing.SolveWithParameters(search_parameters)
-    
-    if solution:
-        print(f"   [OK] Solucion ENCONTRADA con costo objetivo: {solution.ObjectiveValue()}")
+
+def resolver_rutas(
+    data: Dict[str, Any],
+    cfg: Dict[str, Any],
+    tiempo_limite_segundos: Optional[int] = None,
+) -> Tuple[pywrapcp.RoutingIndexManager, pywrapcp.RoutingModel, Any]:
+    """Resuelve el VRP con cada estrategia inicial (Guided Local Search) y retorna la mejor solucion."""
+    print("\n3. Ejecutando motor de optimizacion OR-Tools...")
+    V = data["num_vehicles"]
+    n_ots = len(data["distance_matrix"]) - V
+    if tiempo_limite_segundos:
+        time_limit = tiempo_limite_segundos
     else:
-        print(f"   [WARNING] No se encontro solucion factible")
-    
-    return manager, routing, solution
+        # Automatico: la configuracion es el minimo; ~0.5 s por OT para problemas grandes
+        # (con 60 OTs, 10 s dejaban soluciones ~20% peores que 30 s).
+        time_limit = min(MAX_TIEMPO_SOLVER_S, max(int(cfg.get("solver_time_limit_seconds", 10)), math.ceil(n_ots / 2)))
+    tiempo_por_estrategia = max(1.0, time_limit / len(ESTRATEGIAS_INICIALES))
+    matrices = calcular_matrices_costo(data, cfg)
 
-# =============================================================================
-# 4. DIAGNOSTICO DE ORDENES NO ASIGNADAS
-# =============================================================================
-def diagnosticar_orden_pendiente(ot: Dict[str, Any], nodo_real: int, data: Dict[str, Any], tecnicos: List[Dict[str, Any]]) -> List[str]:
-    """Explica las razones por las que una OT no fue asignada."""
-    razones = []
-    V = data['num_vehicles']
-    idx_orden = nodo_real - V
-    sector = data['orden_sectores'][idx_orden]
-    time_window = data['time_windows'][nodo_real]
-    service_time = data['service_times'][nodo_real]
-    count_sector = data['sector_counts'].get(sector, 0)
+    print(f"   [PROCESS] Resolviendo modelo VRP ({V} tecnicos, {n_ots} OTs, limite {time_limit}s)...")
+    mejor = (None, None, None)
+    for estrategia in ESTRATEGIAS_INICIALES:
+        manager, routing = construir_modelo(data, cfg, matrices)
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = getattr(routing_enums_pb2.FirstSolutionStrategy, estrategia)
+        params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        params.time_limit.FromMilliseconds(int(tiempo_por_estrategia * 1000))
 
-    if ot.get('latitud') is None or ot.get('longitud') is None:
-        razones.append("Coordenadas invalidas. No se pudo enrutar.")
-        return razones
-
-    internal_techs = [t for t in tecnicos if t.get('tipo') == 'interno']
-    if count_sector >= 10:
-        if not internal_techs:
-            razones.append(f"SECTOR: '{sector}' exige solo internos ({count_sector} OTs) y no hay disponibles.")
+        solution = routing.SolveWithParameters(params)
+        if solution:
+            print(f"   [OK] {estrategia}: costo objetivo {solution.ObjectiveValue()}")
+            if mejor[2] is None or solution.ObjectiveValue() < mejor[2].ObjectiveValue():
+                mejor = (manager, routing, solution)
         else:
-            razones.append(f"SECTOR: '{sector}' tiene {count_sector} OTs. Priorizado para internos.")
-        return razones
+            print(f"   [WARNING] {estrategia}: sin solucion factible")
 
-    travel_from_starts = [data['time_matrix'][v][nodo_real] for v in range(V)]
-    min_travel = min(travel_from_starts) if travel_from_starts else 0
-    if min_travel + service_time > time_window[1]:
-        razones.append(f"TIEMPO: Viaje ({min_travel}m) + Servicio ({service_time}m) supera ventana maxima {time_window[1]}m.")
+    if mejor[2] is None:
+        return manager, routing, None
+    return mejor
+
+# =============================================================================
+# 4. DIAGNOSTICO DE OTs NO ASIGNADAS
+# =============================================================================
+def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict[str, Any], carga: List[int]) -> List[str]:
+    """Explica por que una OT quedo sin asignar."""
+    if idx_orden in data["no_ruteables"]:
+        return [data["no_ruteables"][idx_orden]]
+
+    V = data["num_vehicles"]
+    nodo = V + idx_orden
+    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
+    inicio_h = int(cfg.get("inicio_jornada_horas", 8))
+    tiempo = data["time_matrix"]
+    st = data["service_times"][nodo]
+    ini_v, fin_v = data["time_windows"][nodo]
+    razones = []
+
+    # Factibilidad horaria: llegar dentro de la ventana y volver a la base antes del fin de jornada
+    def factible(v: int) -> bool:
+        llegada = tiempo[v][nodo]
+        return llegada <= fin_v and max(ini_v, llegada) + st + tiempo[nodo][v] <= fin_jornada
+
+    if not any(factible(v) for v in range(V)):
+        viaje_min = min(tiempo[v][nodo] for v in range(V))
+        razones.append(
+            f"TIEMPO: ningun tecnico alcanza a iniciar entre "
+            f"{minutos_a_hora_str(ini_v, inicio_h)} y {minutos_a_hora_str(fin_v, inicio_h)} "
+            f"y volver antes del fin de jornada (viaje minimo desde base: {viaje_min} min, servicio: {st} min)."
+        )
+    elif all(carga[v] >= data["vehicle_capacities"][v] for v in range(V)):
+        razones.append("CAPACIDAD: todos los tecnicos completaron su capacidad maxima de OTs.")
 
     if not razones:
-        razones.append("OPTIMIZACION: La ubicacion o ventana colisiona con el recorrido mas eficiente.")
-
+        razones.append(
+            "OPTIMIZACION: no cabe en la jornada junto a las demas OTs asignadas "
+            "(ventanas horarias o tiempos de viaje). Prueba aumentar el tiempo del solver o la flota."
+        )
     return razones
 
 # =============================================================================
-# 5. ANALISIS, REPORTE Y ACTUALIZACION
+# 5. RESULTADO Y APLICACION EN API
 # =============================================================================
-def enviar_asignaciones(
+def _resultado_vacio(status: str, mensaje: str, fecha: Optional[str], ordenes: List[Dict[str, Any]],
+                     alertas: Optional[List[str]] = None, total_tecnicos: int = 0) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "mensaje": mensaje,
+        "fecha": fecha,
+        "resumen": {
+            "total_ots": len(ordenes),
+            "ots_asignadas": 0,
+            "ots_pendientes": len(ordenes),
+            "total_tecnicos": total_tecnicos,
+            "tecnicos_utilizados": 0,
+        },
+        "diagnosticos": [],
+        "alertas": alertas or [],
+        "rutas": [],
+        "aplicacion_cambios": {"aplicado": False},
+    }
+
+
+def construir_resultado(
     manager: pywrapcp.RoutingIndexManager,
     routing: pywrapcp.RoutingModel,
     solution: Any,
     tecnicos: List[Dict[str, Any]],
     ordenes: List[Dict[str, Any]],
     data: Dict[str, Any],
-    session: Optional[requests.Session] = None,
-    api_base_url: str = API_BASE_URL,
-    aplicar_cambios: bool = APLICAR_CAMBIOS
-) -> Dict[str, Any]:
-    """Reporta los resultados y actualiza la API."""
+    cfg: Dict[str, Any],
+    fecha: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Arma hojas de ruta, diagnosticos y la lista de asignaciones (tecnico por OT)."""
     if not solution:
-        return {
-            "status": "infeasible",
-            "mensaje": "No se encontro solucion matematica factible.",
-            "kpis": {"total_ots": len(ordenes), "asignadas": 0, "pendientes": len(ordenes)},
-            "diagnosticos": [],
-            "rutas": []
-        }
+        return _resultado_vacio("infeasible", "No se encontro solucion factible.", fecha, ordenes,
+                                data["alertas"], len(tecnicos)), []
 
-    V = data['num_vehicles']
-    time_dimension = routing.GetDimensionOrDie('Time')
-    dropped_nodes = []
-    inicio_h = int(CONFIG_VRP.get("inicio_jornada_horas", 8))
-    
-    for node in range(routing.Size()):
-        if routing.IsStart(node) or routing.IsEnd(node):
-            continue
-        if solution.Value(routing.NextVar(node)) == node:
-            nodo_real = manager.IndexToNode(node)
-            idx_orden = nodo_real - V
-            dropped_nodes.append(ordenes[idx_orden]['id'])
-    
-    diagnosticos_list = []
-    if dropped_nodes:
-        for ot_id in dropped_nodes:
-            ot = next((orden for orden in ordenes if orden['id'] == ot_id), None)
-            if ot is None:
-                continue
-            idx_orden = next((i for i, orden in enumerate(ordenes) if orden['id'] == ot_id), None)
-            nodo_real = V + idx_orden
-            
-            razones = diagnosticar_orden_pendiente(ot, nodo_real, data, tecnicos)
-            diagnosticos_list.append({
-                "ot_id": ot_id,
-                "tipo": ot.get('tipo'),
-                "hora_programada": ot.get('hora_programada', 'Libre'),
-                "razones": razones
+    V = data["num_vehicles"]
+    dist, tiempo, st = data["distance_matrix"], data["time_matrix"], data["service_times"]
+    time_dim = routing.GetDimensionOrDie("Time")
+    inicio_h = int(cfg.get("inicio_jornada_horas", 8))
+    hora = lambda m: minutos_a_hora_str(m, inicio_h)
+
+    rutas: List[Dict[str, Any]] = []
+    asignaciones: List[Dict[str, Any]] = []
+    carga = [0] * V
+
+    for v, tec in enumerate(tecnicos):
+        index = routing.Start(v)
+        t_salida = solution.Min(time_dim.CumulVar(index))
+        prev_node, prev_inicio = v, t_salida
+        paradas, distancia_m, espera_total = [], 0, 0
+
+        index = solution.Value(routing.NextVar(index))
+        while True:
+            node = manager.IndexToNode(index)
+            distancia_m += dist[prev_node][node]
+            if routing.IsEnd(index):
+                break
+            i = node - V
+            ot = ordenes[i]
+            inicio = solution.Min(time_dim.CumulVar(index))
+            llegada = prev_inicio + st[prev_node] + tiempo[prev_node][node]
+            espera = max(0, inicio - llegada)
+            espera_total += espera
+
+            parada = {
+                "secuencia": len(paradas) + 1,
+                "ot_id": ot["id"],
+                "tipo": ot.get("tipo", "N/A"),
+                "cliente": ot.get("cliente"),
+                "direccion": ot.get("direccion_instalacion", ""),
+                "latitud": ot.get("latitud"),
+                "longitud": ot.get("longitud"),
+                "precision_ubicacion": data["precisiones"][i],
+                "hora_programada": ot.get("hora_programada"),
+                "hora_estimada_llegada": hora(inicio),
+                "hora_estimada_salida": hora(inicio + st[node]),
+                "espera_min": espera,
+                "duracion_servicio_min": st[node],
+                "sector": data["orden_sectores_nombre"][i],
+            }
+            paradas.append(parada)
+            asignaciones.append({
+                "ot_id": ot["id"],
+                "tecnico_id": tec["id"],
+                **{k: parada[k] for k in ("secuencia", "hora_estimada_llegada", "hora_estimada_salida",
+                                          "duracion_servicio_min", "sector")},
             })
-
-    client = session or requests
-    asignaciones_bulk: List[Dict[str, Any]] = []
-    rutas_list: List[Dict[str, Any]] = []
-    
-    for vehicle_id, tecnico_actual in enumerate(tecnicos):
-        index = routing.Start(vehicle_id)
-        paradas_info = []
-        
-        tiempo_inicio_ruta = solution.Min(time_dimension.CumulVar(index))
-        hora_salida_str = minutos_a_hora_str(tiempo_inicio_ruta, inicio_horas=inicio_h)
-        
-        secuencia = 1
-        while not routing.IsEnd(index):
-            nodo_real = manager.IndexToNode(index)
-            if nodo_real >= V:
-                idx_orden = nodo_real - V
-                ot = ordenes[idx_orden]
-                
-                time_var = time_dimension.CumulVar(index)
-                t_llegada_min = solution.Min(time_var)
-                t_servicio = data['service_times'][nodo_real]
-                t_salida_min = t_llegada_min + t_servicio
-                
-                info_parada = {
-                    "secuencia": secuencia,
-                    "ot_id": ot['id'],
-                    "tipo": ot.get('tipo', 'N/A'),
-                    "direccion": ot.get('direccion_instalacion', ''),
-                    "latitud": ot.get('latitud'),
-                    "longitud": ot.get('longitud'),
-                    "hora_estimada_llegada": minutos_a_hora_str(t_llegada_min, inicio_horas=inicio_h),
-                    "hora_estimada_salida": minutos_a_hora_str(t_salida_min, inicio_horas=inicio_h),
-                    "duracion_servicio_min": t_servicio,
-                    "sector": data['orden_sectores'][idx_orden]
-                }
-                paradas_info.append(info_parada)
-                
-                asignaciones_bulk.append({
-                    "ot_id": ot['id'],
-                    "tecnico_id": tecnico_actual['id'],
-                    "secuencia": secuencia,
-                    "hora_estimada_llegada": info_parada["hora_estimada_llegada"],
-                    "hora_estimada_salida": info_parada["hora_estimada_salida"],
-                    "duracion_servicio_min": t_servicio,
-                    "sector": info_parada["sector"]
-                })
-                secuencia += 1
-                
+            prev_node, prev_inicio = node, inicio
             index = solution.Value(routing.NextVar(index))
-        
-        tiempo_fin_ruta = solution.Min(time_dimension.CumulVar(index))
-        hora_retorno_str = minutos_a_hora_str(tiempo_fin_ruta, inicio_horas=inicio_h)
-        total_tiempo_ruta = tiempo_fin_ruta - tiempo_inicio_ruta
-        
-        capacidad = data['vehicle_capacities'][vehicle_id]
-        uso = f"{len(paradas_info)}/{capacidad}"
-        
-        base_lon, base_lat = data.get('coords_bases', [])[vehicle_id] if vehicle_id < len(data.get('coords_bases', [])) else (None, None)
-        
-        nombre_completo = f"{tecnico_actual.get('nombre', '')} {tecnico_actual.get('apellidos', '')}".strip() or tecnico_actual.get('nombre', 'Tecnico')
-        ruta_dict = {
-            "tecnico_id": tecnico_actual['id'],
-            "nombre": nombre_completo,
-            "tipo": tecnico_actual.get('tipo', 'N/A'),
-            "zona_base": tecnico_actual.get('zona', 'N/A'),
+
+        t_retorno = solution.Min(time_dim.CumulVar(index))
+        carga[v] = len(paradas)
+        base_lat, base_lon = data["coords_bases"][v]
+        nombre = f"{tec.get('nombre', '')} {tec.get('apellidos') or ''}".strip() or "Tecnico"
+        rutas.append({
+            "tecnico_id": tec["id"],
+            "nombre": nombre,
+            "tipo": tec.get("tipo", "N/A"),
+            "zona_base": tec.get("zona", "N/A"),
             "base_latitud": base_lat,
             "base_longitud": base_lon,
-            "capacidad_uso": uso,
-            "hora_salida_base": hora_salida_str,
-            "hora_retorno_base": hora_retorno_str,
-            "duracion_total_min": total_tiempo_ruta,
-            "total_ots": len(paradas_info),
-            "paradas": paradas_info
-        }
-        rutas_list.append(ruta_dict)
+            "capacidad_uso": f"{len(paradas)}/{data['vehicle_capacities'][v]}",
+            "hora_salida_base": hora(t_salida) if paradas else None,
+            "hora_retorno_base": hora(t_retorno) if paradas else None,
+            "duracion_total_min": (t_retorno - t_salida) if paradas else 0,
+            "distancia_total_km": round(distancia_m / 1000.0, 1),
+            "tiempo_espera_total_min": espera_total,
+            "total_ots": len(paradas),
+            "paradas": paradas,
+        })
 
-    if aplicar_cambios and asignaciones_bulk:
-        print(f"   [PLANIFICACION] {len(asignaciones_bulk)} OTs asignadas y planificadas en hojas de ruta (Estados originales preservados sin modificar).")
+    diagnosticos = []
+    for i, ot in enumerate(ordenes):
+        index = manager.NodeToIndex(V + i)
+        if solution.Value(routing.NextVar(index)) == index:
+            diagnosticos.append({
+                "ot_id": ot["id"],
+                "tipo": ot.get("tipo"),
+                "hora_programada": ot.get("hora_programada") or "Libre",
+                "sector": data["orden_sectores_nombre"][i],
+                "razones": diagnosticar_orden_pendiente(i, data, cfg, carga),
+            })
 
-    return {
+    # Verificacion de sectores de internos: quien los atendio
+    alertas = list(data["alertas"])
+    sector_por_ot = {ot["id"]: data["orden_sectores"][i] for i, ot in enumerate(ordenes)}
+    nombre_sector = dict(zip(data["orden_sectores"], data["orden_sectores_nombre"]))
+    for sector in sorted(data["sectores_internos"]):
+        tipos = [ru["tipo"] for ru in rutas for p in ru["paradas"] if sector_por_ot[p["ot_id"]] == sector]
+        nombre = nombre_sector[sector]
+        if "interno" not in tipos:
+            alertas.append(f"Sector '{nombre}' ({data['sector_counts'][sector]} OTs) requiere interno, "
+                           f"pero ningun interno pudo atenderlo (horario/capacidad).")
+        elif "externo" in tipos:
+            alertas.append(f"Sector '{nombre}': los internos no alcanzaron a cubrir todo; "
+                           f"{tipos.count('externo')} OTs las atiende un externo de apoyo.")
+
+    resultado = {
         "status": "success",
+        "fecha": fecha,
         "resumen": {
             "total_ots": len(ordenes),
-            "ots_asignadas": len(ordenes) - len(dropped_nodes),
-            "ots_pendientes": len(dropped_nodes),
+            "ots_asignadas": len(asignaciones),
+            "ots_pendientes": len(diagnosticos),
             "total_tecnicos": len(tecnicos),
-            "tecnicos_utilizados": len([r for r in rutas_list if r["total_ots"] > 0]),
-            "costo_objetivo": solution.ObjectiveValue()
+            "tecnicos_utilizados": sum(1 for r in rutas if r["total_ots"] > 0),
+            "distancia_total_km": round(sum(r["distancia_total_km"] for r in rutas), 1),
+            "costo_objetivo": solution.ObjectiveValue(),
+            "fuente_matriz": data["fuente_matriz"],
         },
-        "diagnosticos": diagnosticos_list,
-        "rutas": rutas_list
+        "diagnosticos": diagnosticos,
+        "alertas": alertas,
+        "rutas": rutas,
     }
+    return resultado, asignaciones
+
+
+def aplicar_asignaciones_api(asignaciones: List[Dict[str, Any]], client: Any, api_base_url: str) -> Dict[str, Any]:
+    """Asigna el tecnico de cada OT en la API externa. Omite las OTs que no existen alla."""
+    out: Dict[str, Any] = {"aplicado": True, "enviadas": 0, "omitidas": [], "errores": []}
+    print(f"\n5. Aplicando {len(asignaciones)} asignaciones en la API externa...")
+    try:
+        existentes = {o.get("id") for o in _get_json(client, f"{api_base_url}/ordenes")}
+    except (requests.RequestException, ValueError) as e:
+        out["errores"].append(f"No se pudo validar las OTs en la API externa: {e}")
+        return out
+
+    for a in asignaciones:
+        if a["ot_id"] not in existentes:
+            out["omitidas"].append(a["ot_id"])
+            continue
+        try:
+            res = client.patch(f"{api_base_url}/ordenes/{a['ot_id']}/tecnico",
+                               json={"tecnico_id": a["tecnico_id"]}, timeout=15)
+            if res.status_code == 200:
+                out["enviadas"] += 1
+            else:
+                out["errores"].append(f"{a['ot_id']}: HTTP {res.status_code}")
+        except requests.RequestException as e:
+            out["errores"].append(f"{a['ot_id']}: {e}")
+    print(f"   [API] {out['enviadas']} aplicadas, {len(out['omitidas'])} omitidas, {len(out['errores'])} con error.")
+    return out
 
 # =============================================================================
-# FUNCION PRINCIPAL PROGRAMATICA (EXPORTABLE)
+# FUNCION PRINCIPAL
 # =============================================================================
 def optimizar_jornada(
     fecha: Optional[str] = None,
-    aplicar_cambios: bool = APLICAR_CAMBIOS,
+    aplicar_cambios: bool = False,
     tiempo_limite_segundos: Optional[int] = None,
     api_base_url: str = API_BASE_URL,
     session: Optional[requests.Session] = None,
     tecnicos: Optional[List[Dict[str, Any]]] = None,
     ordenes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    """Funcion modular para ejecutar el pipeline de optimizacion de rutas VRP."""
+    """
+    Ejecuta el pipeline completo. `tecnicos`/`ordenes` recibidos por parametro se usan tal cual
+    (los tecnicos se asumen disponibles); lo que falte se obtiene de la API externa.
+    """
+    cfg = obtener_configuracion()  # Snapshot: cambios de configuracion durante la ejecucion no la afectan
     client = session or requests.Session()
-    if tecnicos is None or ordenes is None:
-        tecnicos, ordenes = obtener_datos_operativos(session=client, api_base_url=api_base_url, fecha=fecha)
-    
+
+    print("1. Obteniendo datos operativos...")
+    try:
+        if ordenes is None:
+            ordenes = obtener_ordenes_pendientes(client, api_base_url, fecha)
+        fecha_efectiva = fecha or inferir_fecha(ordenes)
+        if tecnicos is None:
+            tecnicos, fecha_efectiva = obtener_tecnicos_disponibles(
+                client, api_base_url, fecha_efectiva, permitir_otra_fecha=not fecha)
+    except (requests.RequestException, ValueError) as e:
+        print(f"   [ERROR] API externa: {e}")
+        return _resultado_vacio("error_api", f"No se pudo consultar la API externa: {e}", fecha, ordenes or [])
+
+    print(f"   [RESUMEN] {len(tecnicos)} tecnicos | {len(ordenes)} OTs (fecha: {fecha_efectiva})")
     if not tecnicos or not ordenes:
-        return {
-            "status": "no_data",
-            "mensaje": "Faltan tecnicos disponibles u OTs por asignar para la fecha seleccionada.",
-            "kpis": {"total_ots": len(ordenes) if ordenes else 0, "asignadas": 0, "pendientes": len(ordenes) if ordenes else 0},
-            "rutas": []
-        }
-        
-    data_model = preparar_modelo_datos(tecnicos, ordenes, session=client)
-    manager, routing, solution = resolver_rutas(data_model, tecnicos, tiempo_limite_segundos=tiempo_limite_segundos)
-    resultado = enviar_asignaciones(
-        manager, routing, solution, tecnicos, ordenes, data_model,
-        session=client, api_base_url=api_base_url, aplicar_cambios=aplicar_cambios
-    )
+        return _resultado_vacio("no_data", "Faltan tecnicos disponibles u OTs por asignar para la fecha.",
+                                fecha_efectiva, ordenes, total_tecnicos=len(tecnicos))
+
+    # Copias: el modelo completa coordenadas y no debe mutar los datos del llamador
+    tecnicos = [dict(t) for t in tecnicos]
+    ordenes = [dict(o) for o in ordenes]
+
+    data = preparar_modelo_datos(tecnicos, ordenes, cfg, client)
+    manager, routing, solution = resolver_rutas(data, cfg, tiempo_limite_segundos)
+    resultado, asignaciones = construir_resultado(manager, routing, solution, tecnicos, ordenes, data, cfg, fecha_efectiva)
+
+    if aplicar_cambios and asignaciones:
+        resultado["aplicacion_cambios"] = aplicar_asignaciones_api(asignaciones, client, api_base_url)
+    else:
+        resultado["aplicacion_cambios"] = {"aplicado": False}
     return resultado
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Optimizador de Rutas VRP Avanzado")
-    parser.add_argument("--reset", action="store_true", help="Llama al endpoint /api/reset antes de obtener datos")
-    parser.add_argument("--aplicar", action="store_true", help="Aplica los cambios en la API (equivalente a APLICAR_CAMBIOS=true)")
+
+    parser = argparse.ArgumentParser(description="Optimizador de Rutas VRP")
+    parser.add_argument("--fecha", help="Fecha a optimizar (YYYY-MM-DD). Por defecto se infiere de las OTs.")
+    parser.add_argument("--reset", action="store_true", help="Llama a /api/reset de la API externa antes de optimizar")
+    parser.add_argument("--aplicar", action="store_true", help="Aplica las asignaciones en la API externa")
     args = parser.parse_args()
-    
-    print("OPTIMIZADOR DE RUTAS VRP AVANZADO")
-    with requests.Session() as session:
+
+    print("OPTIMIZADOR DE RUTAS VRP")
+    with requests.Session() as s:
         if args.reset:
-            print("-> Llamando a /api/reset para regenerar datos...")
             try:
-                res = session.post(f"{API_BASE_URL}/reset")
-                if res.status_code == 200:
-                    print("   [OK] Datos regenerados en la API")
-                else:
-                    print(f"   [WARNING] /api/reset respondio con {res.status_code}")
-            except Exception as e:
-                print(f"   [ERROR] No se pudo hacer reset en la API: {e}")
-                
-        aplicar_final = args.aplicar or APLICAR_CAMBIOS
-        optimizar_jornada(aplicar_cambios=aplicar_final, session=session)
+                r = s.post(f"{API_BASE_URL}/reset", timeout=25)
+                print(f"-> /api/reset: HTTP {r.status_code}")
+            except requests.RequestException as e:
+                print(f"-> /api/reset fallo: {e}")
+        res = optimizar_jornada(fecha=args.fecha, aplicar_cambios=args.aplicar, session=s)
+
+    print("\n=== RESULTADO ===")
+    print(json.dumps(res["resumen"], indent=2, ensure_ascii=False))
+    for r in res["rutas"]:
+        print(f"- {r['nombre']} ({r['tipo']}): {r['capacidad_uso']} OTs, {r['distancia_total_km']} km, "
+              f"{r['hora_salida_base'] or '--'} -> {r['hora_retorno_base'] or '--'}")
+    for d in res["diagnosticos"]:
+        print(f"! {d['ot_id']}: {' | '.join(d['razones'])}")
+    for a in res["alertas"]:
+        print(f"~ {a}")
