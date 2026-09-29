@@ -16,34 +16,28 @@ import copy
 import json
 import math
 import os
-import re
-import time
-import unicodedata
 from datetime import date
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
+from geocoding import (
+    COORD_DEFAULT,
+    cargar_coordenadas_comunas,
+    coordenada_valida,
+    extraer_comuna,
+    normalizar_texto,
+    resolver_comuna_ot,
+    resolver_coordenadas_ordenes,
+)
+
 # =============================================================================
 # CONFIGURACION
 # =============================================================================
-BASE_DIR = Path(__file__).resolve().parent
-COMUNAS_JSON_PATH = BASE_DIR / "Latitud - Longitud Chile.json"
-GEOCODING_CACHE_PATH = BASE_DIR / "geocoding_cache.json"
-
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
 OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-USER_AGENT = "optimizador-rutas-chile/4.0"
 
-# Bounding box de Chile
-LAT_MIN, LAT_MAX = -56.5, -17.5
-LON_MIN, LON_MAX = -75.6, -66.5
-
-COORD_DEFAULT = (-33.4372, -70.6572)  # Santiago Centro, ultimo recurso
 MAX_NODOS_OSRM = 100                  # Limite practico del servidor publico de OSRM
 MAX_TIEMPO_SOLVER_S = 120
 
@@ -87,6 +81,7 @@ DEFAULT_CONFIG_VRP: Dict[str, Any] = {
     # Servicios externos
     "usar_osrm": True,
     "usar_geocoding": True,
+    "geocoding_max_segundos": 60,   # tope por ejecucion (~3 s por direccion nueva); el resto queda para la proxima
 }
 
 CONFIG_VRP: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG_VRP)
@@ -137,206 +132,9 @@ def minutos_a_hora_str(minutos: int, inicio_horas: int) -> str:
     return f"{(total // 60) % 24:02d}:{total % 60:02d}"
 
 
-def normalizar_texto(texto: Any) -> str:
-    """Minusculas, sin tildes ni espacios sobrantes (para cruces exactos)."""
-    if not texto:
-        return ""
-    texto = str(texto).strip().lower()
-    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
-
-
-def coordenada_valida(lat: Any, lon: Any) -> bool:
-    """True si (lat, lon) son numeros dentro del territorio chileno."""
-    try:
-        lat, lon = float(lat), float(lon)
-    except (TypeError, ValueError):
-        return False
-    return LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX
-
 # =============================================================================
-# COMUNAS Y GEOCODIFICACION
+# UBICACION DE TECNICOS Y SECTORES (geocodificacion de OTs en geocoding.py)
 # =============================================================================
-@lru_cache(maxsize=1)
-def cargar_coordenadas_comunas() -> Dict[str, Tuple[float, float, str]]:
-    """Carga (una sola vez) las comunas de Chile: nombre normalizado -> (lat, lon, nombre original)."""
-    comunas: Dict[str, Tuple[float, float, str]] = {}
-    if not COMUNAS_JSON_PATH.exists():
-        print(f"   [WARNING] Archivo '{COMUNAS_JSON_PATH.name}' no encontrado.")
-        return comunas
-    try:
-        with open(COMUNAS_JSON_PATH, "r", encoding="utf-8") as f:
-            datos = json.load(f)
-        for item in datos:
-            nombre = (item.get("Comuna") or "").strip()
-            lat = item.get("Latitud (Decimal)")
-            lon = item.get("Longitud (decimal)") or item.get("Longitud (Decimal)")
-            if nombre and lat is not None and lon is not None:
-                comunas[normalizar_texto(nombre)] = (float(lat), float(lon), nombre)
-    except (OSError, ValueError) as e:
-        print(f"   [ERROR] Fallo al procesar '{COMUNAS_JSON_PATH.name}': {e}")
-        return comunas
-
-    alias = {
-        "santiago centro": "santiago",
-        "stgo centro": "santiago",
-        "la calera": "calera",
-        "marchigue": "marchihue",
-        "llay llay": "llaillay",
-    }
-    for a, original in alias.items():
-        if original in comunas:
-            comunas[a] = comunas[original]
-    return comunas
-
-
-@lru_cache(maxsize=1)
-def _comunas_por_longitud() -> Tuple[str, ...]:
-    return tuple(sorted(cargar_coordenadas_comunas(), key=len, reverse=True))
-
-
-def extraer_comuna(texto: str) -> Optional[str]:
-    """
-    Detecta la comuna (normalizada) presente en un texto.
-    Primero por segmentos separados por coma; luego por palabra completa,
-    probando las comunas de nombre mas largo primero.
-    """
-    if not texto:
-        return None
-    comunas = cargar_coordenadas_comunas()
-    texto_norm = normalizar_texto(texto)
-    for parte in (p.strip() for p in texto_norm.split(",")):
-        if parte in comunas:
-            return parte
-    for c in _comunas_por_longitud():
-        if len(c) >= 4 and re.search(rf"\b{re.escape(c)}\b", texto_norm):
-            return c
-    return None
-
-
-def cargar_geocoding_cache() -> Dict[str, Tuple[float, float]]:
-    if GEOCODING_CACHE_PATH.exists():
-        try:
-            with open(GEOCODING_CACHE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {k: (float(v[0]), float(v[1])) for k, v in data.items()
-                    if isinstance(v, (list, tuple)) and len(v) == 2}
-        except (OSError, ValueError) as e:
-            print(f"   [WARNING] Error leyendo cache de geocodificacion: {e}")
-    return {}
-
-
-def guardar_geocoding_cache(cache: Dict[str, Tuple[float, float]]) -> None:
-    try:
-        with open(GEOCODING_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-    except OSError as e:
-        print(f"   [WARNING] No se pudo persistir cache de geocodificacion: {e}")
-
-
-def limpiar_direccion_para_geocoding(direccion: str) -> str:
-    """Remueve complementos interiores (depto, piso, oficina...) para mejorar el acierto en Nominatim."""
-    if not direccion:
-        return ""
-    patron_interior = (r'(?i)\b(?:depto|dpto|departamento|piso|of|oficina|block|bloque|local|sitio|'
-                       r'bodega|casa|edificio|torre|habitacion|habitación)\.?\s*#?\s*[a-zA-Z0-9\-]+')
-    limpia = re.sub(patron_interior, '', direccion)
-    limpia = re.sub(r'(\s*,\s*)+', ', ', limpia)
-    return re.sub(r'\s+', ' ', limpia).strip(' ,')
-
-
-def geocode_direccion(
-    direccion: str,
-    session: Optional[requests.Session] = None,
-    max_intentos: int = 2,
-) -> Tuple[Optional[float], Optional[float]]:
-    """Geocodifica una direccion con Nominatim (reintentos con backoff ante 429/errores de red)."""
-    client = session or requests
-    headers = {"User-Agent": USER_AGENT, "Accept-Language": "es"}
-
-    dir_limpia = limpiar_direccion_para_geocoding(direccion)
-    consultas = [q for q in dict.fromkeys([dir_limpia, direccion]) if q]
-
-    for query in consultas:
-        params = {"q": query, "format": "json", "limit": 1, "countrycodes": "cl", "addressdetails": 0}
-        for intento in range(1, max_intentos + 1):
-            try:
-                res = client.get(NOMINATIM_URL, params=params, headers=headers, timeout=6)
-                if res.status_code == 429:
-                    espera = 1.5 * intento
-                    print(f"   [RATE LIMIT] Nominatim 429. Reintentando en {espera}s...")
-                    time.sleep(espera)
-                    continue
-                res.raise_for_status()
-                data = res.json()
-                if data:
-                    lat, lon = float(data[0]["lat"]), float(data[0]["lon"])
-                    if coordenada_valida(lat, lon):
-                        return lat, lon
-                break
-            except requests.RequestException:
-                time.sleep(1.0)
-            except (KeyError, IndexError, ValueError):
-                break
-    return None, None
-
-
-def resolver_coordenadas_ordenes(
-    ordenes: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    session: Optional[requests.Session] = None,
-) -> List[str]:
-    """
-    Asegura latitud/longitud en cada OT (modifica las OTs) y retorna la precision obtenida por OT:
-    original -> cache -> geocoding (Nominatim) -> comuna (centroide) -> aproximada (Santiago Centro).
-    """
-    comunas = cargar_coordenadas_comunas()
-    cache = cargar_geocoding_cache()
-    cache_actualizado = False
-    precisiones: List[str] = []
-
-    for ot in ordenes:
-        if coordenada_valida(ot.get("latitud"), ot.get("longitud")):
-            ot["latitud"], ot["longitud"] = float(ot["latitud"]), float(ot["longitud"])
-            precisiones.append("original")
-            continue
-
-        direccion = (ot.get("direccion_instalacion") or "").strip()
-        comuna_ot = (ot.get("comuna") or "").strip()
-        region_ot = (ot.get("region") or "").strip()
-
-        consulta = ", ".join(p for p in [direccion, comuna_ot, region_ot, "Chile"] if p)
-        clave_cache = normalizar_texto(limpiar_direccion_para_geocoding(consulta))
-
-        if clave_cache in cache:
-            ot["latitud"], ot["longitud"] = cache[clave_cache]
-            precisiones.append("cache")
-            continue
-
-        if cfg.get("usar_geocoding", True) and direccion:
-            lat, lon = geocode_direccion(consulta, session=session)
-            time.sleep(1.0)  # Politica de uso de Nominatim: max 1 req/s (tambien tras fallos)
-            if lat is not None and lon is not None:
-                ot["latitud"], ot["longitud"] = lat, lon
-                cache[clave_cache] = (lat, lon)
-                cache_actualizado = True
-                precisiones.append("geocoding")
-                continue
-
-        comuna = normalizar_texto(comuna_ot)
-        if comuna not in comunas:
-            comuna = extraer_comuna(direccion)
-        if comuna:
-            ot["latitud"], ot["longitud"] = comunas[comuna][:2]
-            precisiones.append("comuna")
-        else:
-            ot["latitud"], ot["longitud"] = COORD_DEFAULT
-            precisiones.append("aproximada")
-
-    if cache_actualizado:
-        guardar_geocoding_cache(cache)
-    return precisiones
-
-
 def resolver_base_tecnico(tecnico: Dict[str, Any]) -> Tuple[Tuple[float, float], str]:
     """Coordenadas de la base de un tecnico: explicitas -> centroide de su zona/comuna -> Santiago Centro."""
     for k_lat, k_lon in (("base_latitud", "base_longitud"), ("latitud", "longitud")):
@@ -350,15 +148,11 @@ def resolver_base_tecnico(tecnico: Dict[str, Any]) -> Tuple[Tuple[float, float],
 
 def sector_de_orden(ot: Dict[str, Any]) -> Tuple[Optional[str], str]:
     """Retorna (clave normalizada del sector, nombre para mostrar). Clave None si no se reconoce."""
-    comunas = cargar_coordenadas_comunas()
-    comuna_ot = (ot.get("comuna") or "").strip()
-    clave = normalizar_texto(comuna_ot) if comuna_ot else None
-    if not clave or clave not in comunas:
-        clave = extraer_comuna(ot.get("direccion_instalacion") or "") or clave
-    if not clave:
-        return None, "Sin sector"
-    nombre = comunas[clave][2] if clave in comunas else comuna_ot
-    return clave, nombre
+    clave = resolver_comuna_ot(ot)
+    if clave:
+        return clave, cargar_coordenadas_comunas()[clave][2]
+    comuna_ot = (ot.get("comuna") or "").strip()  # Comuna no reconocida: se usa el texto tal cual
+    return (normalizar_texto(comuna_ot), comuna_ot) if comuna_ot else (None, "Sin sector")
 
 # =============================================================================
 # MATRICES DE DISTANCIA Y TIEMPO
@@ -514,10 +308,18 @@ def preparar_modelo_datos(
         coords_bases.append(coord)
 
     # Ubicacion de OTs
-    precisiones = resolver_coordenadas_ordenes(ordenes, cfg, session)
+    precisiones, sin_tiempo = resolver_coordenadas_ordenes(
+        ordenes, usar_geocoding=cfg.get("usar_geocoding", True),
+        max_segundos=float(cfg.get("geocoding_max_segundos", 60)), session=session)
     for ot, precision in zip(ordenes, precisiones):
         if precision == "aproximada":
             alertas.append(f"OT {ot.get('id')}: ubicacion no resuelta; se usa Santiago Centro (ruta poco confiable).")
+        elif precision == "comuna":
+            alertas.append(f"OT {ot.get('id')}: direccion '{ot.get('direccion_instalacion')}' no encontrada en el mapa; "
+                           f"se usa el centro de la comuna.")
+    if sin_tiempo:
+        alertas.append(f"{sin_tiempo} direcciones nuevas no alcanzaron a geocodificarse (limite de "
+                       f"{cfg.get('geocoding_max_segundos', 60)} s); se resolveran en las proximas ejecuciones.")
     coords_ots = [(ot["latitud"], ot["longitud"]) for ot in ordenes]
     alertas += alertas_radio_operacional(coords_bases, coords_ots, ordenes, cfg)
 

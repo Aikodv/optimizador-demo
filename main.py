@@ -30,6 +30,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+import geocoding
 import optimizador
 
 # =============================================================================
@@ -314,6 +315,7 @@ class ConfiguracionVRPRequest(BaseModel):
     solver_time_limit_seconds: Optional[int] = Field(default=None, ge=1, le=120)
     usar_osrm: Optional[bool] = None
     usar_geocoding: Optional[bool] = None
+    geocoding_max_segundos: Optional[int] = Field(default=None, ge=0, le=600)
 
 # =============================================================================
 # DASHBOARD
@@ -487,6 +489,25 @@ def get_ruta_tecnico(id: str, fecha: Optional[str] = Query(default=None)):
         "fecha": fecha,
         "total_ots": 0,
         "paradas": [],
+    }
+
+
+@app.get("/api/geocoding", tags=["Rutas y Despacho"], summary="Probar la geocodificacion de una direccion")
+def probar_geocoding(direccion: str = Query(..., min_length=3), comuna: Optional[str] = None):
+    """Muestra como se interpreta y resuelve una direccion (usa y actualiza el cache de geocodificacion)."""
+    ot = {"direccion_instalacion": direccion, "comuna": comuna}
+    comuna_norm = geocoding.resolver_comuna_ot(ot)
+    calle, numero = geocoding.separar_calle_numero(direccion)
+    cache = geocoding.cargar_cache()
+    resultado = geocoding.geocodificar_direccion(direccion, comuna_norm, cache=cache)
+    geocoding.guardar_cache(cache)
+    if not resultado and comuna_norm:
+        lat, lon, _ = geocoding.cargar_coordenadas_comunas()[comuna_norm]
+        resultado = {"lat": lat, "lon": lon, "precision": "comuna", "fuente": "centroide"}
+    return {
+        "interpretacion": {"calle": calle, "numero": numero, "comuna": comuna_norm},
+        "resultado": resultado or {"precision": "aproximada", "lat": geocoding.COORD_DEFAULT[0],
+                                   "lon": geocoding.COORD_DEFAULT[1], "fuente": "default"},
     }
 
 

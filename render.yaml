@@ -7,3 +7,6 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Email de contacto para Nominatim (politica de uso). El valor se define en el panel de Render.
+      - key: GEOCODING_EMAIL
+        sync: false

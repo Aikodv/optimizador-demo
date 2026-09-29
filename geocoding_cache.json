@@ -1,230 +1,142 @@
 {
-  "avenida apoquindo #4500, las condes, santiago, chile": [
-    -33.4080694,
-    -70.5642254
-  ],
-  "av. pajaritos 3456, maipu, santiago, chile": [
-    -33.516426,
-    -70.7572167
-  ],
-  "avenida providencia #1234, providencia, santiago, chile": [
-    -33.4290115,
-    -70.6211027
-  ],
-  "santiago 675": [
-    -33.4376995,
-    -70.6510671
-  ],
-  "avenida diego portales 822": [
-    -33.039348,
-    -71.6026347
-  ],
-  "errazuriz 563": [
-    -33.0283544,
-    -71.5537277
-  ],
-  "vicente martinez 129": [
-    -33.0485273,
-    -71.3872907
-  ],
-  "avenida libertad 1348": [
-    -33.0088361,
-    -71.5472973
-  ],
-  "arlegui 615": [
-    -33.0234875,
-    -71.5534911
-  ],
-  "avenida pedro montt 1730": [
-    -33.047168,
-    -71.6139308
-  ],
-  "pedro montt 2855": [
-    -26.183333,
-    -69.983333
-  ],
-  "avenida libertador bernardo o'higgins 3349": [
-    -33.450647,
-    -70.6794464
-  ],
-  "jose miguel de la barra 650": [
-    -33.4353388,
-    -70.643578
-  ],
-  "avenida libertador bernardo o'higgins 227": [
-    -33.4393115,
-    -70.6399272
-  ],
-  "avenida santos dumont 999": [
-    -33.4224111,
-    -70.6425926
-  ],
-  "avenida libertador bernardo o'higgins 3750": [
-    -33.4538591,
-    -70.6864494
-  ],
-  "avenida libertador bernardo o'higgins 3065": [
-    -34.1564773,
-    -70.7671547
-  ],
-  "carelmapu 2": [
-    -39.8451283,
-    -73.2361764
-  ],
-  "carampangue 865": [
-    -34.5836064,
-    -70.9898193
-  ],
-  "avenida libertador bernardo o'higgins 201": [
-    -33.4380038,
-    -70.6378653
-  ],
-  "avenida alvarez 1532": [
-    -33.0244254,
-    -71.5644065
-  ],
-  "condell 1490": [
-    -33.4481739,
-    -70.6253891
-  ],
-  "avenida vicuna mackenna 7110": [
-    -33.4733752,
-    -70.6235339
-  ],
-  "avenida andres bello 2425": [
-    -33.417987,
-    -70.6064246
-  ],
-  "agustinas 794": [
-    -33.441167,
-    -70.6475666
-  ],
-  "avenida grecia 2001": [
-    -33.4645117,
-    -70.6114458
-  ],
-  "plaza de armas 242": [
-    -34.6397628,
-    -71.3656334
-  ],
-  "plaza de los heroes 445": [
-    -34.1704478,
-    -70.7414586
-  ],
-  "avenida libertador bernardo o'higgins 3363": [
-    -33.4507378,
-    -70.6800701
-  ],
-  "avenida santa maria 0500": [
-    -33.4327146,
-    -70.6280003
-  ],
-  "avenida libertador bernardo o'higgins 611": [
-    -34.1642127,
-    -70.7416026
-  ],
-  "avenida errazuriz 501": [
-    -45.5752343,
-    -72.0688941
-  ],
-  "avenida pedro montt 1730, valparaiso, valparaiso, chile": [
-    -33.0473748,
-    -71.6096372
-  ],
-  "pedro montt 2855, valparaiso, valparaiso, chile": [
-    -33.0288373,
-    -71.5712911
-  ],
-  "condell 1490, valparaiso, valparaiso, chile": [
-    -33.0462856,
-    -71.6212796
-  ],
-  "avenida libertad 1348, vina del mar, valparaiso, chile": [
-    -33.0088361,
-    -71.5472973
-  ],
-  "errazuriz 563, vina del mar, valparaiso, chile": [
-    -33.0283544,
-    -71.5537277
-  ],
-  "santiago 675, villa alemana, valparaiso, chile": [
-    -33.0435245,
-    -71.3715422
-  ],
-  "arlegui 615, vina del mar, valparaiso, chile": [
-    -33.0234875,
-    -71.5534911
-  ],
-  "avenida libertador bernardo o'higgins 3363, estacion central, metropolitana de santiago, chile": [
-    -33.4507378,
-    -70.6800701
-  ],
-  "avenida santa maria 0500, providencia, metropolitana de santiago, chile": [
-    -33.4327146,
-    -70.6280003
-  ],
-  "jose miguel de la barra 650, santiago, metropolitana de santiago, chile": [
-    -33.4353388,
-    -70.643578
-  ],
-  "agustinas 794, santiago, metropolitana de santiago, chile": [
-    -33.441167,
-    -70.6475666
-  ],
-  "avenida libertador bernardo o'higgins 3349, estacion central, metropolitana de santiago, chile": [
-    -33.450647,
-    -70.6794464
-  ],
-  "carampangue 865, san fernando, libertador general bernardo o'higgins, chile": [
-    -34.5833458,
-    -70.9903059
-  ],
-  "avenida libertador bernardo o'higgins 611, rancagua, libertador general bernardo o'higgins, chile": [
-    -34.1642127,
-    -70.7416026
-  ],
-  "avenida libertador bernardo o'higgins 3065, rancagua, libertador general bernardo o'higgins, chile": [
-    -34.1549146,
-    -70.7665854
-  ],
-  "avenida errazuriz 501, santa cruz, libertador general bernardo o'higgins, chile": [
-    -34.6284852,
-    -71.34764
-  ],
-  "avenida alvarez 1532, vina del mar, valparaiso, chile": [
-    -33.0244254,
-    -71.5644065
-  ],
-  "avenida vicuna mackenna 7110, la florida, metropolitana de santiago, chile": [
-    -33.5533288,
-    -70.5867835
-  ],
-  "san pablo 967, santiago, metropolitana de santiago, chile": [
-    -33.4341253,
-    -70.6511635
-  ],
-  "avenida libertador bernardo o'higgins 651, santiago, metropolitana de santiago, chile": [
-    -33.4420638,
-    -70.6456647
-  ],
-  "avenida santos dumont 999, independencia, metropolitana de santiago, chile": [
-    -33.419581,
-    -70.6623987
-  ],
-  "avenida libertador bernardo o'higgins 201, rancagua, libertador general bernardo o'higgins, chile": [
-    -34.1653991,
-    -70.7390549
-  ],
-  "plaza de los heroes 445, rancagua, libertador general bernardo o'higgins, chile": [
-    -34.1704478,
-    -70.7414586
-  ],
-  "carelmapu 2, san fernando, libertador general bernardo o'higgins, chile": [
-    -34.5773574,
-    -70.9914173
-  ],
-  "augusto carozzi 841, quilpue, valparaiso, chile": [
-    -33.0448391,
-    -71.4428565
-  ]
+ "entradas": {
+  "augusto carozzi 841|quilpue": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.0448391,
+   "lon": -71.4428565,
+   "precision": "numero"
+  },
+  "avenida alvarez 1532|vina del mar": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.0296102,
+   "lon": -71.5420797,
+   "precision": "numero"
+  },
+  "avenida apoquindo 4500|las condes": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.4105267,
+   "lon": -70.5732381,
+   "precision": "calle"
+  },
+  "avenida bornand 30|rancagua": {
+   "fecha": "2026-09-29",
+   "precision": "no_encontrada"
+  },
+  "avenida diego portales 822|quilpue": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.0469169,
+   "lon": -71.4408527,
+   "precision": "numero"
+  },
+  "avenida libertador bernardo o'higgins 201|rancagua": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -34.1653991,
+   "lon": -70.7390549,
+   "precision": "calle"
+  },
+  "avenida libertador bernardo o'higgins 3065|rancagua": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -34.1549146,
+   "lon": -70.7665854,
+   "precision": "numero"
+  },
+  "avenida libertador bernardo o'higgins 651|santiago": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.4420638,
+   "lon": -70.6456647,
+   "precision": "numero"
+  },
+  "avenida pedro montt 1730|valparaiso": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.0473662,
+   "lon": -71.6099947,
+   "precision": "calle"
+  },
+  "avenida pedro montt 2855|valparaiso": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.0473662,
+   "lon": -71.6099947,
+   "precision": "calle"
+  },
+  "avenida santos dumont 999|independencia": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.4176182,
+   "lon": -70.653077,
+   "precision": "numero"
+  },
+  "avenida vicuna mackenna 7110|la florida": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.5175543,
+   "lon": -70.5983734,
+   "precision": "numero"
+  },
+  "carelmapu 2|san fernando": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -34.5773574,
+   "lon": -70.9914173,
+   "precision": "calle"
+  },
+  "condell 1490|valparaiso": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.0462856,
+   "lon": -71.6212796,
+   "precision": "calle"
+  },
+  "errazuriz 563|vina del mar": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.0283544,
+   "lon": -71.5537277,
+   "precision": "numero"
+  },
+  "jose miguel de la barra 650|santiago": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.4353388,
+   "lon": -70.643578,
+   "precision": "numero"
+  },
+  "pedro montt 2855|valparaiso": {
+   "fecha": "2026-09-29",
+   "fuente": "photon",
+   "lat": -33.0473385,
+   "lon": -71.6110402,
+   "precision": "calle"
+  },
+  "plaza de los heroes 445|rancagua": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -34.1704478,
+   "lon": -70.7414586,
+   "precision": "numero"
+  },
+  "san pablo 967|santiago": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.4341253,
+   "lon": -70.6511635,
+   "precision": "numero"
+  },
+  "santiago 675|villa alemana": {
+   "fecha": "2026-09-29",
+   "fuente": "nominatim",
+   "lat": -33.0436841,
+   "lon": -71.3769162,
+   "precision": "calle"
+  }
+ },
+ "version": 2
 }
