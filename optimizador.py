@@ -38,51 +38,125 @@ from geocoding import (
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
 OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
 
-MAX_NODOS_OSRM = 100                  # Limite practico del servidor publico de OSRM
-MAX_TIEMPO_SOLVER_S = 120
+def _p(clave: str, default: Any, tipo: str, grupo: str, ambito: str, origen: str, etiqueta: str,
+       descripcion: str, unidad: Optional[str] = None, minimo: Optional[float] = None,
+       maximo: Optional[float] = None) -> Dict[str, Any]:
+    return {"clave": clave, "etiqueta": etiqueta, "descripcion": descripcion, "tipo": tipo, "unidad": unidad,
+            "minimo": minimo, "maximo": maximo, "default": default, "grupo": grupo, "ambito": ambito, "origen": origen}
 
-DEFAULT_CONFIG_VRP: Dict[str, Any] = {
-    # Tiempos de servicio por tipo de OT (minutos)
-    "tiempos_servicio_por_tipo": {
-        "instalacion_simple": 45,
-        "instalacion_con_corte": 90,
-        "mantencion": 40,
-        "retiro": 25,
-    },
-    "tiempo_servicio_default": 30,
 
-    # Jornada
-    "inicio_jornada_horas": 8,          # 08:00 es el minuto 0
-    "fin_jornada_minutos": 600,         # 10 horas (hasta 18:00)
-    "ventana_tolerancia_min": 30,       # +/- minutos alrededor de la hora acordada
-
-    # Capacidad maxima de OTs por tipo de tecnico (tope; el cap_max individual puede reducirla)
-    "capacidad_max_externo": 8,
-    "capacidad_max_interno": 12,
-
-    # Geometria vial
-    "factor_sinuosidad_vial": 1.30,
-    "velocidad_promedio_kmh": 30.0,
-    "max_radio_operacional_km": 80.0,
-
-    # Costos (unidades de costo = metros)
-    # penalty_drop_node debe ser mayor que penalty_mix_sector: dejar una OT sin
-    # asignar tiene que ser peor que mezclar sectores en la ruta de un interno.
-    "penalty_drop_node": 10_000_000,
-    "penalty_mix_sector": 100_000,
-    "span_cost_coefficient": 50,
-    "costo_por_ot_externo": 0,               # >0 da preferencia general a internos (ej: 20000 = 20 km extra por OT externa)
-    # Sectores con MAS de N OTs se asignan a internos: un externo solo toma OTs ahi si a los
-    # internos no les alcanza capacidad/horario (cada una le cuesta la penalizacion). 0 = desactivado.
-    "umbral_ots_sector_interno": 10,
-    "penalty_externo_sector_interno": 1_000_000,  # < penalty_drop_node: mejor un externo que dejar la OT sin atender
-    "solver_time_limit_seconds": 10,         # minimo; se amplia automaticamente con muchas OTs (0.5 s/OT, max 120 s)
-
-    # Servicios externos
-    "usar_osrm": True,
-    "usar_geocoding": True,
-    "geocoding_max_segundos": 60,   # tope por ejecucion (~3 s por direccion nueva); el resto queda para la proxima
+AMBITOS = {
+    "negocio": "Regla de la operacion: la decide la planificadora y va en el panel de configuracion.",
+    "solver": "Interno del modelo/solver: lo ajusta el equipo tecnico; no se expone a la planificadora.",
+    "servicio": "Integracion con servicios externos (ruteo, geocodificacion): lo ajusta el equipo tecnico.",
 }
+ORIGENES = {
+    "operacion_cliente": "Refleja como opera el cliente (jornada, duraciones, capacidades, reglas de sector).",
+    "supuesto_equipo": "Supuesto o calibracion del equipo de desarrollo; no fue entregado por el cliente.",
+}
+
+# Catalogo unico de parametros: de aqui salen los valores por defecto, la validacion del
+# endpoint de configuracion y la documentacion (GET /api/optimizador/configuracion/parametros).
+# Las penalizaciones estan en unidades de costo = metros.
+PARAMETROS: List[Dict[str, Any]] = [
+    # --- Tiempos de servicio ---
+    _p("tiempos_servicio_por_tipo",
+       {"instalacion_simple": 45, "instalacion_con_corte": 90, "mantencion": 40, "retiro": 25},
+       "dict_int", "tiempos_servicio", "negocio", "operacion_cliente", "Duracion del servicio por tipo de OT",
+       "Minutos que el tecnico permanece en el domicilio segun el tipo de OT.", "min", 1, 600),
+    _p("tiempo_servicio_default", 30, "int", "tiempos_servicio", "negocio", "supuesto_equipo",
+       "Duracion para tipos de OT no listados", "Minutos de servicio cuando el tipo de OT no tiene duracion definida.",
+       "min", 1, 600),
+
+    # --- Jornada ---
+    _p("inicio_jornada_horas", 8, "int", "jornada", "negocio", "operacion_cliente", "Inicio de jornada",
+       "Hora del dia en que los tecnicos salen de su base (minuto 0 del modelo).", "hora del dia", 5, 12),
+    _p("fin_jornada_minutos", 600, "int", "jornada", "negocio", "operacion_cliente", "Duracion de la jornada",
+       "Minutos desde el inicio de jornada en que el tecnico debe estar de vuelta en su base (600 = 10 horas).",
+       "min", 180, 1440),
+    _p("ventana_tolerancia_min", 30, "int", "jornada", "negocio", "supuesto_equipo", "Tolerancia de la hora acordada",
+       "Minutos antes/despues de la hora programada en que se permite iniciar el servicio.", "min", 0, 240),
+
+    # --- Capacidad ---
+    _p("capacidad_max_externo", 8, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico externo",
+       "Tope de OTs diarias de un externo; el cap_max individual del tecnico solo puede reducirlo.", "OTs", 1, 30),
+    _p("capacidad_max_interno", 12, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico interno",
+       "Tope de OTs diarias de un interno; el cap_max individual del tecnico solo puede reducirlo.", "OTs", 1, 30),
+
+    # --- Sectores ---
+    _p("umbral_ots_sector_interno", 10, "int", "sectores", "negocio", "operacion_cliente",
+       "OTs por sector para reservarlo a internos",
+       "Los sectores (comunas) con MAS de este numero de OTs se reservan a tecnicos internos. 0 = desactivado.",
+       "OTs", 0, 100),
+    _p("sectores_internos_exclusivos", False, "bool", "sectores", "negocio", "supuesto_equipo",
+       "Sectores reservados exclusivos de internos",
+       "true: un externo nunca atiende OTs de un sector reservado (las que no alcancen los internos quedan sin "
+       "asignar con causa sectorial). false: el externo puede apoyar pagando penalty_externo_sector_interno."),
+    _p("costo_por_ot_externo", 0, "int", "sectores", "negocio", "supuesto_equipo", "Preferencia por tecnicos internos",
+       "Costo extra por cada OT atendida por un externo (20000 = equivale a 20 km). 0 = sin preferencia.",
+       "metros", 0, None),
+    _p("max_radio_operacional_km", 80.0, "float", "sectores", "negocio", "supuesto_equipo", "Radio operacional",
+       "Distancia desde el centroide de las bases sobre la cual una OT genera alerta (no impide asignarla).",
+       "km", 10.0, 300.0),
+
+    # --- Georreferencia ---
+    _p("excluir_ots_sin_georreferencia", True, "bool", "georreferencia", "negocio", "supuesto_equipo",
+       "No rutear OTs sin ubicacion",
+       "true: una OT sin coordenadas, cuya direccion no se pudo geocodificar y sin comuna reconocible, queda sin "
+       "asignar con causa de georreferencia. false: se rutea hacia Santiago Centro (ruta poco confiable)."),
+
+    # --- Red vial (respaldo cuando no hay distancias de OSRM) ---
+    _p("factor_sinuosidad_vial", 1.30, "float", "red_vial", "solver", "supuesto_equipo", "Factor de sinuosidad",
+       "Multiplicador de la distancia en linea recta para estimar la distancia por calles en la matriz de respaldo.",
+       None, 1.0, 3.0),
+    _p("velocidad_promedio_kmh", 30.0, "float", "red_vial", "solver", "supuesto_equipo", "Velocidad promedio",
+       "Velocidad usada para estimar tiempos de viaje en la matriz de respaldo.", "km/h", 10.0, 120.0),
+
+    # --- Funcion objetivo ---
+    # penalty_drop_node debe ser mayor que las demas penalizaciones: dejar una OT sin asignar
+    # tiene que ser peor que mezclar sectores o que la atienda un externo.
+    _p("penalty_drop_node", 10_000_000, "int", "objetivo", "solver", "supuesto_equipo", "Penalizacion por OT sin asignar",
+       "Costo de dejar una OT fuera de las rutas. Debe ser mayor que las demas penalizaciones.", "metros", 0, None),
+    _p("penalty_mix_sector", 100_000, "int", "objetivo", "solver", "supuesto_equipo",
+       "Penalizacion por mezclar sectores (internos)",
+       "Costo de que un interno pase entre OTs de sectores distintos. 0 = desactivado.", "metros", 0, None),
+    _p("penalty_externo_sector_interno", 1_000_000, "int", "objetivo", "solver", "supuesto_equipo",
+       "Penalizacion por externo en sector reservado",
+       "Costo de cada OT de un sector reservado a internos atendida por un externo. Menor que penalty_drop_node: "
+       "es preferible un externo a dejar la OT sin atender.", "metros", 0, None),
+    _p("span_cost_coefficient", 50, "int", "objetivo", "solver", "supuesto_equipo", "Balance de carga entre tecnicos",
+       "Coeficiente sobre la duracion de la ruta mas larga; mas alto reparte mejor la carga. 0 = desactivado.",
+       None, 0, 500),
+
+    # --- Solver ---
+    _p("solver_time_limit_seconds", 10, "int", "solver", "solver", "supuesto_equipo", "Tiempo minimo de busqueda",
+       "Segundos minimos de busqueda cuando la corrida no indica tiempo_limite_segundos.", "s", 1, 600),
+    _p("solver_segundos_por_ot", 0.5, "float", "solver", "solver", "supuesto_equipo", "Segundos de busqueda por OT",
+       "El tiempo automatico de busqueda crece con el problema: OTs x este valor (acotado por minimo y maximo).",
+       "s/OT", 0.0, 5.0),
+    _p("solver_time_limit_max_seconds", 120, "int", "solver", "solver", "supuesto_equipo", "Tiempo maximo de busqueda",
+       "Tope de segundos de busqueda, tanto automatico como pedido por la corrida.", "s", 1, 600),
+
+    # --- Servicios externos ---
+    _p("usar_osrm", True, "bool", "servicios_externos", "servicio", "supuesto_equipo", "Usar distancias viales (OSRM)",
+       "false: la matriz se calcula siempre con la estimacion de respaldo (linea recta x sinuosidad)."),
+    _p("max_nodos_osrm", 100, "int", "servicios_externos", "servicio", "supuesto_equipo", "Maximo de puntos para OSRM",
+       "Sobre este numero de puntos (tecnicos + OTs) se usa la matriz de respaldo: limite practico del servidor "
+       "publico de OSRM.", "puntos", 2, 1000),
+    _p("usar_geocoding", True, "bool", "servicios_externos", "servicio", "supuesto_equipo", "Geocodificar direcciones",
+       "false: las OTs sin coordenadas se ubican directamente en el centro de su comuna."),
+    _p("geocoding_max_segundos", 60, "int", "servicios_externos", "servicio", "supuesto_equipo",
+       "Tiempo maximo de geocodificacion por corrida",
+       "Las direcciones nuevas que no alcancen (~3 s cada una) usan el centro de la comuna y se resuelven en la "
+       "proxima corrida.", "s", 0, 600),
+
+    # --- Ejecucion ---
+    _p("aplicar_cambios_por_defecto", False, "bool", "ejecucion", "negocio", "supuesto_equipo",
+       "Aplicar asignaciones automaticamente",
+       "Valor de aplicar_cambios cuando la corrida no lo indica: true asigna los tecnicos en la API de ordenes."),
+]
+
+DEFAULT_CONFIG_VRP: Dict[str, Any] = {p["clave"]: p["default"] for p in PARAMETROS}
 
 CONFIG_VRP: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG_VRP)
 
@@ -90,6 +164,29 @@ CONFIG_VRP: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG_VRP)
 def obtener_configuracion() -> Dict[str, Any]:
     """Retorna una copia de la configuracion actual del optimizador."""
     return copy.deepcopy(CONFIG_VRP)
+
+
+def obtener_catalogo_parametros() -> Dict[str, Any]:
+    """Parametros documentados: los persistentes (con su valor actual) y los propios de cada corrida."""
+    cfg = obtener_configuracion()
+    ejecucion = [
+        _p("fecha", None, "str", "ejecucion", "negocio", "operacion_cliente", "Fecha a planificar",
+           "YYYY-MM-DD. Sin valor se usa la fecha programada mas temprana entre las OTs por asignar."),
+        _p("aplicar_cambios", None, "bool", "ejecucion", "negocio", "supuesto_equipo", "Aplicar asignaciones",
+           "true asigna los tecnicos en la API de ordenes; false solo propone las rutas. Sin valor se usa "
+           "aplicar_cambios_por_defecto de la configuracion."),
+        _p("tiempo_limite_segundos", None, "int", "ejecucion", "solver", "supuesto_equipo", "Tiempo de busqueda",
+           "Sin valor (recomendado) se calcula segun la cantidad de OTs con los parametros solver_* de la configuracion.",
+           "s", 1, cfg["solver_time_limit_max_seconds"]),
+    ]
+    for p in ejecucion:
+        p["default_efectivo"] = cfg["aplicar_cambios_por_defecto"] if p["clave"] == "aplicar_cambios" else None
+    return {
+        "ambitos": AMBITOS,
+        "origenes": ORIGENES,
+        "parametros_configuracion": [dict(p, valor=cfg[p["clave"]]) for p in PARAMETROS],
+        "parametros_ejecucion": ejecucion,
+    }
 
 
 def actualizar_configuracion(nuevos_valores: Dict[str, Any]) -> Dict[str, Any]:
@@ -111,6 +208,112 @@ def restaurar_configuracion() -> Dict[str, Any]:
     CONFIG_VRP = copy.deepcopy(DEFAULT_CONFIG_VRP)
     print("   [CONFIG] Parametros VRP restaurados a valores iniciales.")
     return obtener_configuracion()
+
+# =============================================================================
+# MODELO DE OPTIMIZACION (declaracion explicita) Y CAUSAS DE NO ASIGNACION
+# =============================================================================
+# Causas por las que una OT queda sin asignar: codigo -> (categoria, prefijo del texto, descripcion).
+CAUSAS: Dict[str, Tuple[str, str, str]] = {
+    "SIN_GEORREFERENCIA": ("georreferencia", "GEORREFERENCIA",
+                           "La OT no tiene coordenadas, su direccion no se pudo geocodificar y su comuna no se reconoce."),
+    "SECTOR_RESERVADO_INTERNOS": ("sectorial", "SECTOR",
+                                  "La OT es de un sector reservado a internos y la regla de sector impidio que la tomara "
+                                  "un externo que si alcanzaba."),
+    "DURACION_EXCEDE_JORNADA": ("temporal", "DURACION", "El servicio dura mas que la jornada completa."),
+    "HORA_FUERA_DE_JORNADA": ("temporal", "HORARIO", "La hora programada queda fuera de la jornada."),
+    "VENTANA_INALCANZABLE": ("temporal", "TIEMPO",
+                             "Ningun tecnico alcanza a llegar dentro de la ventana horaria y volver a su base."),
+    "CAPACIDAD_AGOTADA": ("capacidad", "CAPACIDAD", "Los tecnicos que podian atenderla completaron su maximo de OTs."),
+    "SIN_CUPO_EN_RUTAS": ("optimizacion", "OPTIMIZACION",
+                          "Individualmente era atendible, pero no cabe en la jornada junto a las demas OTs asignadas."),
+}
+
+
+def _causa(codigo: str, detalle: str) -> Dict[str, str]:
+    return {"codigo": codigo, "categoria": CAUSAS[codigo][0], "detalle": detalle}
+
+
+def _razon(causa: Dict[str, str]) -> str:
+    """Texto con prefijo ('TIEMPO: ...'): formato historico del campo `razones`."""
+    return f"{CAUSAS[causa['codigo']][1]}: {causa['detalle']}"
+
+
+def describir_modelo() -> Dict[str, Any]:
+    """Declaracion del modelo tal como lo construyen construir_modelo() y calcular_matrices_costo()."""
+    return {
+        "tipo": "VRP con ventanas horarias, capacidad, multiples depositos y visitas opcionales (Google OR-Tools Routing)",
+        "nodos": "Una base por tecnico (inicio y fin de su ruta) y un nodo por OT.",
+        "variables": [
+            {"nombre": "next[i]", "descripcion": "Nodo que se visita despues del nodo i (define la secuencia de cada ruta)."},
+            {"nombre": "vehiculo[i]", "descripcion": "Tecnico que atiende la OT i."},
+            {"nombre": "activa[i]", "descripcion": "1 si la OT i queda asignada, 0 si queda sin asignar."},
+            {"nombre": "tiempo[i]", "descripcion": "Minuto (desde el inicio de jornada) en que comienza el servicio en i."},
+            {"nombre": "carga[i]", "descripcion": "Cantidad de OTs acumuladas por el tecnico al llegar a i."},
+        ],
+        "funcion_objetivo": {
+            "sentido": "minimizar",
+            "unidad": "metros (las penalizaciones se expresan en metros equivalentes)",
+            "terminos": [
+                {"termino": "Distancia vial recorrida por todos los tecnicos", "parametros": []},
+                {"termino": "penalty_drop_node por cada OT sin asignar", "parametros": ["penalty_drop_node"]},
+                {"termino": "penalty_mix_sector por cada cambio de sector en la ruta de un interno",
+                 "parametros": ["penalty_mix_sector"]},
+                {"termino": "penalty_externo_sector_interno por cada OT de un sector reservado atendida por un externo",
+                 "parametros": ["penalty_externo_sector_interno", "umbral_ots_sector_interno"]},
+                {"termino": "costo_por_ot_externo por cada OT atendida por un externo", "parametros": ["costo_por_ot_externo"]},
+                {"termino": "span_cost_coefficient x duracion de la ruta mas larga (balance de carga)",
+                 "parametros": ["span_cost_coefficient"]},
+                {"termino": "1 por cada minuto de la hora de retorno a la base (rutas compactas, sin esperas)",
+                 "parametros": []},
+            ],
+        },
+        "restricciones_implementadas": [
+            {"codigo": "R1", "nombre": "Asignacion unica", "tipo": "dura",
+             "descripcion": "Cada OT se visita a lo mas una vez y por un solo tecnico."},
+            {"codigo": "R2", "nombre": "Base del tecnico", "tipo": "dura",
+             "descripcion": "Cada ruta parte y termina en la base del tecnico."},
+            {"codigo": "R3", "nombre": "Jornada", "tipo": "dura",
+             "descripcion": "Toda la ruta (viajes, esperas y servicios) ocurre dentro de la jornada.",
+             "parametros": ["inicio_jornada_horas", "fin_jornada_minutos"]},
+            {"codigo": "R4", "nombre": "Ventana horaria", "tipo": "dura",
+             "descripcion": "Una OT con hora programada inicia dentro de hora +/- tolerancia; el servicio debe "
+                            "terminar antes del fin de jornada.",
+             "parametros": ["ventana_tolerancia_min", "tiempos_servicio_por_tipo", "tiempo_servicio_default"]},
+            {"codigo": "R5", "nombre": "Capacidad", "tipo": "dura",
+             "descripcion": "Cada tecnico atiende como maximo su capacidad de OTs.",
+             "parametros": ["capacidad_max_interno", "capacidad_max_externo"]},
+            {"codigo": "R6", "nombre": "Georreferencia", "tipo": "dura (configurable)",
+             "descripcion": "Una OT sin ubicacion resoluble no se rutea.",
+             "parametros": ["excluir_ots_sin_georreferencia"]},
+            {"codigo": "R7", "nombre": "Sector reservado a internos", "tipo": "blanda, o dura si sectores_internos_exclusivos",
+             "descripcion": "Los sectores con mas OTs que el umbral se asignan a internos.",
+             "parametros": ["umbral_ots_sector_interno", "sectores_internos_exclusivos", "penalty_externo_sector_interno"]},
+            {"codigo": "R8", "nombre": "Continuidad de sector", "tipo": "blanda",
+             "descripcion": "Se evita que un interno mezcle sectores en su ruta.", "parametros": ["penalty_mix_sector"]},
+            {"codigo": "R9", "nombre": "Visita opcional", "tipo": "blanda",
+             "descripcion": "Una OT puede quedar sin asignar pagando una penalizacion alta; asi el modelo siempre "
+                            "tiene solucion y reporta las OTs pendientes con su causa.",
+             "parametros": ["penalty_drop_node"]},
+        ],
+        "restricciones_fuera_de_esta_version": [
+            "Habilidades o certificaciones del tecnico segun el tipo de OT.",
+            "Horario individual por tecnico: todos comparten la misma jornada.",
+            "Pausa de colacion y descansos.",
+            "Trafico variable segun la hora: la matriz de tiempos es unica para todo el dia.",
+            "Prioridad o SLA de las OTs: todas pesan lo mismo al decidir cual queda sin asignar.",
+            "Materiales, equipos o stock del vehiculo: la capacidad solo cuenta OTs.",
+            "Dependencias entre OTs (precedencias) y OTs que requieren mas de un tecnico.",
+            "Planificacion de varios dias y re-optimizacion durante la jornada.",
+        ],
+        "causas_no_asignacion": [{"codigo": c, "categoria": cat, "prefijo_razon": pre, "descripcion": desc}
+                                 for c, (cat, pre, desc) in CAUSAS.items()],
+        "resolucion": {
+            "solver": "OR-Tools Routing (CP + busqueda local)",
+            "estrategias_iniciales": list(ESTRATEGIAS_INICIALES),
+            "metaheuristica": "GUIDED_LOCAL_SEARCH",
+            "nota": "Es una heuristica con limite de tiempo: entrega la mejor solucion encontrada, no garantiza el optimo.",
+        },
+    }
 
 # =============================================================================
 # UTILIDADES DE TIEMPO Y TEXTO
@@ -311,8 +514,15 @@ def preparar_modelo_datos(
     precisiones, sin_tiempo = resolver_coordenadas_ordenes(
         ordenes, usar_geocoding=cfg.get("usar_geocoding", True),
         max_segundos=float(cfg.get("geocoding_max_segundos", 60)), session=session)
-    for ot, precision in zip(ordenes, precisiones):
-        if precision == "aproximada":
+    excluir_sin_geo = bool(cfg.get("excluir_ots_sin_georreferencia", True))
+    no_ruteables: Dict[int, Dict[str, str]] = {}   # OTs que se excluyen del modelo, con su causa
+    for i, (ot, precision) in enumerate(zip(ordenes, precisiones)):
+        if precision == "aproximada" and excluir_sin_geo:
+            no_ruteables[i] = _causa(
+                "SIN_GEORREFERENCIA",
+                f"no trae coordenadas, la direccion '{ot.get('direccion_instalacion') or ''}' no se pudo "
+                f"geocodificar y la comuna '{ot.get('comuna') or ''}' no se reconoce.")
+        elif precision == "aproximada":
             alertas.append(f"OT {ot.get('id')}: ubicacion no resuelta; se usa Santiago Centro (ruta poco confiable).")
         elif precision == "comuna":
             alertas.append(f"OT {ot.get('id')}: direccion '{ot.get('direccion_instalacion')}' no encontrada en el mapa; "
@@ -321,15 +531,25 @@ def preparar_modelo_datos(
         alertas.append(f"{sin_tiempo} direcciones nuevas no alcanzaron a geocodificarse (limite de "
                        f"{cfg.get('geocoding_max_segundos', 60)} s); se resolveran en las proximas ejecuciones.")
     coords_ots = [(ot["latitud"], ot["longitud"]) for ot in ordenes]
-    alertas += alertas_radio_operacional(coords_bases, coords_ots, ordenes, cfg)
+    con_ubicacion = [i for i in range(len(ordenes)) if i not in no_ruteables]
+    alertas += alertas_radio_operacional(coords_bases, [coords_ots[i] for i in con_ubicacion],
+                                         [ordenes[i] for i in con_ubicacion], cfg)
 
-    # Matrices
+    # Matrices: distancias viales (OSRM) con respaldo en linea recta x factor de sinuosidad
     coords = coords_bases + coords_ots
-    if cfg.get("usar_osrm", True) and len(coords) <= MAX_NODOS_OSRM:
-        dist, tiempo, fuente = obtener_matrices_osrm(coords, cfg, session)
-    else:
+    max_nodos = int(cfg.get("max_nodos_osrm", 100))
+    if not cfg.get("usar_osrm", True):
         dist, tiempo = generar_matrices_haversine(coords, cfg)
         fuente = "haversine"
+    elif len(coords) > max_nodos:
+        dist, tiempo = generar_matrices_haversine(coords, cfg)
+        fuente = "haversine"
+        alertas.append(f"Matriz de distancias estimada (respaldo): {len(coords)} puntos superan el maximo de "
+                       f"{max_nodos} del servicio de ruteo.")
+    else:
+        dist, tiempo, fuente = obtener_matrices_osrm(coords, cfg, session)
+        if fuente != "osrm":
+            alertas.append("Matriz de distancias estimada (respaldo): el servicio de ruteo vial no respondio.")
 
     # Tiempos de servicio
     tiempos_cfg = cfg.get("tiempos_servicio_por_tipo", {})
@@ -365,13 +585,13 @@ def preparar_modelo_datos(
     inicio_h = int(cfg.get("inicio_jornada_horas", 8))
     tolerancia = int(cfg.get("ventana_tolerancia_min", 30))
     time_windows: List[Tuple[int, int]] = [(0, fin_jornada)] * V
-    no_ruteables: Dict[int, str] = {}
 
     for i, ot in enumerate(ordenes):
         st = service_times[V + i]
         ultima_hora_inicio = fin_jornada - st
         if ultima_hora_inicio < 0:
-            no_ruteables[i] = f"DURACION: el servicio ({st} min) excede la jornada completa ({fin_jornada} min)."
+            no_ruteables.setdefault(i, _causa(
+                "DURACION_EXCEDE_JORNADA", f"el servicio ({st} min) excede la jornada completa ({fin_jornada} min)."))
             time_windows.append((0, 0))
             continue
 
@@ -383,11 +603,11 @@ def preparar_modelo_datos(
         inicio_v = max(0, prog - tolerancia)
         fin_v = min(ultima_hora_inicio, prog + tolerancia)
         if fin_v < inicio_v:
-            no_ruteables[i] = (
-                f"HORARIO: hora programada {ot.get('hora_programada')} fuera de la jornada "
+            no_ruteables.setdefault(i, _causa(
+                "HORA_FUERA_DE_JORNADA",
+                f"hora programada {ot.get('hora_programada')} fuera de la jornada "
                 f"({minutos_a_hora_str(0, inicio_h)}-{minutos_a_hora_str(ultima_hora_inicio, inicio_h)} "
-                f"como ultimo inicio para {st} min de servicio)."
-            )
+                f"como ultimo inicio para {st} min de servicio)."))
             time_windows.append((0, ultima_hora_inicio))
         else:
             time_windows.append((inicio_v, fin_v))
@@ -408,6 +628,8 @@ def preparar_modelo_datos(
         "orden_sectores_nombre": [nombre for _, nombre in sectores],
         "sector_counts": sector_counts,
         "sectores_internos": sectores_internos,
+        # Restriccion sectorial dura: en sectores reservados solo se permiten internos
+        "sector_exclusivo": bool(cfg.get("sectores_internos_exclusivos", False)) and bool(sectores_internos),
         "time_windows": time_windows,
         "no_ruteables": no_ruteables,
         "precisiones": precisiones,
@@ -483,7 +705,8 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
     for v in range(V):
         time_dim.SetCumulVarSoftUpperBound(routing.End(v), 0, 1)
 
-    # Ventanas horarias y descarte penalizado
+    # Ventanas horarias, descarte penalizado y sectores exclusivos de internos
+    no_internos = [v for v, tipo in enumerate(data["tipos_tecnico"]) if tipo != "interno"]
     for node in range(V, n):
         index = manager.NodeToIndex(node)
         routing.AddDisjunction([index], penalty_drop)
@@ -492,6 +715,9 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
             continue
         ini, fin = data["time_windows"][node]
         time_dim.CumulVar(index).SetRange(ini, fin)
+        if data["sector_exclusivo"] and data["orden_sectores"][node - V] in data["sectores_internos"]:
+            for v in no_internos:
+                routing.VehicleVar(index).RemoveValue(v)
 
     # Capacidad (cantidad de OTs por tecnico)
     cb_demanda = routing.RegisterUnaryTransitVector(data["demands"])
@@ -504,6 +730,17 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
 ESTRATEGIAS_INICIALES = ("PATH_CHEAPEST_ARC", "PARALLEL_CHEAPEST_INSERTION")
 
 
+def calcular_tiempo_limite(cfg: Dict[str, Any], n_ots: int, solicitado: Optional[int] = None) -> int:
+    """Segundos de busqueda: el pedido por la corrida o, si no, el automatico segun la cantidad de OTs."""
+    maximo = int(cfg.get("solver_time_limit_max_seconds", 120))
+    if solicitado:
+        return max(1, min(maximo, int(solicitado)))
+    # Automatico: la configuracion es el minimo y crece con el problema
+    # (con 60 OTs, 10 s dejaban soluciones ~20% peores que 30 s).
+    por_ot = float(cfg.get("solver_segundos_por_ot", 0.5))
+    return min(maximo, max(int(cfg.get("solver_time_limit_seconds", 10)), math.ceil(n_ots * por_ot)))
+
+
 def resolver_rutas(
     data: Dict[str, Any],
     cfg: Dict[str, Any],
@@ -513,12 +750,8 @@ def resolver_rutas(
     print("\n3. Ejecutando motor de optimizacion OR-Tools...")
     V = data["num_vehicles"]
     n_ots = len(data["distance_matrix"]) - V
-    if tiempo_limite_segundos:
-        time_limit = tiempo_limite_segundos
-    else:
-        # Automatico: la configuracion es el minimo; ~0.5 s por OT para problemas grandes
-        # (con 60 OTs, 10 s dejaban soluciones ~20% peores que 30 s).
-        time_limit = min(MAX_TIEMPO_SOLVER_S, max(int(cfg.get("solver_time_limit_seconds", 10)), math.ceil(n_ots / 2)))
+    time_limit = calcular_tiempo_limite(cfg, n_ots, tiempo_limite_segundos)
+    data["tiempo_limite_s"] = time_limit
     tiempo_por_estrategia = max(1.0, time_limit / len(ESTRATEGIAS_INICIALES))
     matrices = calcular_matrices_costo(data, cfg)
 
@@ -546,8 +779,9 @@ def resolver_rutas(
 # =============================================================================
 # 4. DIAGNOSTICO DE OTs NO ASIGNADAS
 # =============================================================================
-def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict[str, Any], carga: List[int]) -> List[str]:
-    """Explica por que una OT quedo sin asignar."""
+def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict[str, Any],
+                                 carga: List[int]) -> List[Dict[str, str]]:
+    """Clasifica por que una OT quedo sin asignar. Retorna causas {codigo, categoria, detalle}; la primera es la principal."""
     if idx_orden in data["no_ruteables"]:
         return [data["no_ruteables"][idx_orden]]
 
@@ -558,29 +792,46 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
     tiempo = data["time_matrix"]
     st = data["service_times"][nodo]
     ini_v, fin_v = data["time_windows"][nodo]
-    razones = []
 
     # Factibilidad horaria: llegar dentro de la ventana y volver a la base antes del fin de jornada
     def factible(v: int) -> bool:
         llegada = tiempo[v][nodo]
         return llegada <= fin_v and max(ini_v, llegada) + st + tiempo[nodo][v] <= fin_jornada
 
-    if not any(factible(v) for v in range(V)):
+    alcanzan = [v for v in range(V) if factible(v)]
+    if not alcanzan:
         viaje_min = min(tiempo[v][nodo] for v in range(V))
-        razones.append(
-            f"TIEMPO: ningun tecnico alcanza a iniciar entre "
+        return [_causa(
+            "VENTANA_INALCANZABLE",
+            f"ningun tecnico alcanza a iniciar entre "
             f"{minutos_a_hora_str(ini_v, inicio_h)} y {minutos_a_hora_str(fin_v, inicio_h)} "
-            f"y volver antes del fin de jornada (viaje minimo desde base: {viaje_min} min, servicio: {st} min)."
-        )
-    elif all(carga[v] >= data["vehicle_capacities"][v] for v in range(V)):
-        razones.append("CAPACIDAD: todos los tecnicos completaron su capacidad maxima de OTs.")
+            f"y volver antes del fin de jornada (viaje minimo desde base: {viaje_min} min, servicio: {st} min).")]
 
-    if not razones:
-        razones.append(
-            "OPTIMIZACION: no cabe en la jornada junto a las demas OTs asignadas "
-            "(ventanas horarias o tiempos de viaje). Prueba aumentar el tiempo del solver o la flota."
-        )
-    return razones
+    con_cupo = [v for v in alcanzan if carga[v] < data["vehicle_capacities"][v]]
+
+    # Sectorial: la regla de sector reservado dejo fuera a externos que alcanzaban y tenian cupo.
+    # Aplica si la regla es dura, o si la penalizacion configurada es tan cara como dejar la OT sin asignar.
+    if data["orden_sectores"][idx_orden] in data["sectores_internos"]:
+        regla_impide = data["sector_exclusivo"] or (
+            int(cfg.get("penalty_externo_sector_interno", 0)) >= int(cfg.get("penalty_drop_node", 0)))
+        externos_libres = [v for v in con_cupo if data["tipos_tecnico"][v] != "interno"]
+        if regla_impide and externos_libres:
+            sector = data["orden_sectores_nombre"][idx_orden]
+            return [_causa(
+                "SECTOR_RESERVADO_INTERNOS",
+                f"el sector '{sector}' ({data['sector_counts'][data['orden_sectores'][idx_orden]]} OTs) esta reservado a "
+                f"tecnicos internos y ninguno pudo tomarla; {len(externos_libres)} externo(s) con cupo y horario "
+                f"quedaron excluidos por la regla de sector.")]
+        if data["sector_exclusivo"]:
+            con_cupo = [v for v in con_cupo if data["tipos_tecnico"][v] == "interno"]
+
+    if not con_cupo:
+        return [_causa("CAPACIDAD_AGOTADA",
+                       "los tecnicos que alcanzan a atenderla completaron su capacidad maxima de OTs.")]
+    return [_causa(
+        "SIN_CUPO_EN_RUTAS",
+        "no cabe en la jornada junto a las demas OTs asignadas (ventanas horarias o tiempos de viaje). "
+        "Prueba aumentar el tiempo del solver o la flota.")]
 
 # =============================================================================
 # 5. RESULTADO Y APLICACION EN API
@@ -595,6 +846,7 @@ def _resultado_vacio(status: str, mensaje: str, fecha: Optional[str], ordenes: L
             "total_ots": len(ordenes),
             "ots_asignadas": 0,
             "ots_pendientes": len(ordenes),
+            "pendientes_por_causa": {categoria: 0 for categoria in dict.fromkeys(c[0] for c in CAUSAS.values())},
             "total_tecnicos": total_tecnicos,
             "tecnicos_utilizados": 0,
         },
@@ -700,12 +952,21 @@ def construir_resultado(
     for i, ot in enumerate(ordenes):
         index = manager.NodeToIndex(V + i)
         if solution.Value(routing.NextVar(index)) == index:
+            causas = diagnosticar_orden_pendiente(i, data, cfg, carga)
+            sin_ubicacion = causas[0]["codigo"] == "SIN_GEORREFERENCIA"  # Sus coordenadas son un relleno, no se informan
             diagnosticos.append({
                 "ot_id": ot["id"],
                 "tipo": ot.get("tipo"),
+                "cliente": ot.get("cliente"),
+                "direccion": ot.get("direccion_instalacion", ""),
+                "latitud": None if sin_ubicacion else ot.get("latitud"),
+                "longitud": None if sin_ubicacion else ot.get("longitud"),
+                "precision_ubicacion": data["precisiones"][i],
                 "hora_programada": ot.get("hora_programada") or "Libre",
                 "sector": data["orden_sectores_nombre"][i],
-                "razones": diagnosticar_orden_pendiente(i, data, cfg, carga),
+                "causa_principal": causas[0]["categoria"],
+                "causas": causas,
+                "razones": [_razon(c) for c in causas],
             })
 
     # Verificacion de sectores de internos: quien los atendio
@@ -722,6 +983,13 @@ def construir_resultado(
             alertas.append(f"Sector '{nombre}': los internos no alcanzaron a cubrir todo; "
                            f"{tipos.count('externo')} OTs las atiende un externo de apoyo.")
 
+    pendientes_por_causa = {categoria: 0 for categoria in dict.fromkeys(c[0] for c in CAUSAS.values())}
+    for d in diagnosticos:
+        pendientes_por_causa[d["causa_principal"]] += 1
+    precision_ubicaciones: Dict[str, int] = {}
+    for precision in data["precisiones"]:
+        precision_ubicaciones[precision] = precision_ubicaciones.get(precision, 0) + 1
+
     resultado = {
         "status": "success",
         "fecha": fecha,
@@ -729,11 +997,13 @@ def construir_resultado(
             "total_ots": len(ordenes),
             "ots_asignadas": len(asignaciones),
             "ots_pendientes": len(diagnosticos),
+            "pendientes_por_causa": pendientes_por_causa,
             "total_tecnicos": len(tecnicos),
             "tecnicos_utilizados": sum(1 for r in rutas if r["total_ots"] > 0),
             "distancia_total_km": round(sum(r["distancia_total_km"] for r in rutas), 1),
             "costo_objetivo": solution.ObjectiveValue(),
             "fuente_matriz": data["fuente_matriz"],
+            "precision_ubicaciones": precision_ubicaciones,
         },
         "diagnosticos": diagnosticos,
         "alertas": alertas,
@@ -773,7 +1043,7 @@ def aplicar_asignaciones_api(asignaciones: List[Dict[str, Any]], client: Any, ap
 # =============================================================================
 def optimizar_jornada(
     fecha: Optional[str] = None,
-    aplicar_cambios: bool = False,
+    aplicar_cambios: Optional[bool] = None,
     tiempo_limite_segundos: Optional[int] = None,
     api_base_url: str = API_BASE_URL,
     session: Optional[requests.Session] = None,
@@ -783,8 +1053,33 @@ def optimizar_jornada(
     """
     Ejecuta el pipeline completo. `tecnicos`/`ordenes` recibidos por parametro se usan tal cual
     (los tecnicos se asumen disponibles); lo que falte se obtiene de la API externa.
+    `aplicar_cambios` y `tiempo_limite_segundos` en None toman su valor de la configuracion.
     """
     cfg = obtener_configuracion()  # Snapshot: cambios de configuracion durante la ejecucion no la afectan
+    resultado = _optimizar(cfg, fecha, aplicar_cambios, tiempo_limite_segundos, api_base_url, session, tecnicos, ordenes)
+    # Parametros con los que efectivamente se resolvio (los de la corrida y la configuracion vigente)
+    resultado["parametros_corrida"] = {
+        "fecha": resultado.get("fecha"),
+        "aplicar_cambios": cfg["aplicar_cambios_por_defecto"] if aplicar_cambios is None else aplicar_cambios,
+        "tiempo_limite_segundos": resultado.pop("_tiempo_limite_s", None),
+        "tiempo_limite_origen": "corrida" if tiempo_limite_segundos else "automatico",
+        "configuracion": cfg,
+    }
+    return resultado
+
+
+def _optimizar(
+    cfg: Dict[str, Any],
+    fecha: Optional[str],
+    aplicar_cambios: Optional[bool],
+    tiempo_limite_segundos: Optional[int],
+    api_base_url: str,
+    session: Optional[requests.Session],
+    tecnicos: Optional[List[Dict[str, Any]]],
+    ordenes: Optional[List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    if aplicar_cambios is None:
+        aplicar_cambios = bool(cfg["aplicar_cambios_por_defecto"])
     client = session or requests.Session()
 
     print("1. Obteniendo datos operativos...")
@@ -811,6 +1106,7 @@ def optimizar_jornada(
     data = preparar_modelo_datos(tecnicos, ordenes, cfg, client)
     manager, routing, solution = resolver_rutas(data, cfg, tiempo_limite_segundos)
     resultado, asignaciones = construir_resultado(manager, routing, solution, tecnicos, ordenes, data, cfg, fecha_efectiva)
+    resultado["_tiempo_limite_s"] = data["tiempo_limite_s"]
 
     if aplicar_cambios and asignaciones:
         resultado["aplicacion_cambios"] = aplicar_asignaciones_api(asignaciones, client, api_base_url)

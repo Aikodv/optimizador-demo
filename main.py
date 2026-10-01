@@ -20,7 +20,7 @@ import re
 import uuid
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 import requests
 from faker import Faker
@@ -28,7 +28,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 import geocoding
 import optimizador
@@ -179,6 +179,8 @@ generar_datos_locales()
 
 # Hojas de ruta planificadas: {fecha | "default": {tecnico_id: ruta}}. "default" = ultima optimizacion.
 DB_RUTAS_PLANIFICADAS: Dict[str, Dict[str, Any]] = {}
+# OTs que el optimizador no pudo asignar, con sus razones: {fecha | "default": [diagnostico]}.
+DB_PENDIENTES: Dict[str, List[Dict[str, Any]]] = {}
 
 # =============================================================================
 # ACCESO A DATOS (API externa con respaldo local)
@@ -270,9 +272,11 @@ class OrdenInput(BaseModel):
 
 class EjecutarOptimizacionRequest(BaseModel):
     fecha: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    aplicar_cambios: bool = False
+    aplicar_cambios: Optional[bool] = Field(
+        default=None, description="Por defecto usa aplicar_cambios_por_defecto de la configuracion.")
     tiempo_limite_segundos: Optional[int] = Field(
-        default=None, ge=1, le=120, description="Por defecto usa solver_time_limit_seconds de la configuracion.")
+        default=None, ge=1, description="Por defecto se calcula segun la cantidad de OTs (parametros solver_* de la "
+                                        "configuracion). Maximo: solver_time_limit_max_seconds.")
     tecnicos: Optional[List[TecnicoInput]] = Field(
         default=None, description="Si se envian, se usan en vez de consultar la API externa (se asumen disponibles).")
     ordenes: Optional[List[OrdenInput]] = Field(
@@ -295,27 +299,20 @@ class RegenerarDatosRequest(BaseModel):
     dias_disponibilidad: int = Field(default=14, ge=1, le=30)
 
 
-class ConfiguracionVRPRequest(BaseModel):
-    tiempos_servicio_por_tipo: Optional[Dict[str, int]] = None
-    tiempo_servicio_default: Optional[int] = Field(default=None, ge=1, le=600)
-    inicio_jornada_horas: Optional[int] = Field(default=None, ge=5, le=12)
-    fin_jornada_minutos: Optional[int] = Field(default=None, ge=180, le=1440)
-    ventana_tolerancia_min: Optional[int] = Field(default=None, ge=0, le=240)
-    capacidad_max_externo: Optional[int] = Field(default=None, ge=1, le=30)
-    capacidad_max_interno: Optional[int] = Field(default=None, ge=1, le=30)
-    factor_sinuosidad_vial: Optional[float] = Field(default=None, ge=1.0, le=3.0)
-    velocidad_promedio_kmh: Optional[float] = Field(default=None, ge=10.0, le=120.0)
-    max_radio_operacional_km: Optional[float] = Field(default=None, ge=10.0, le=300.0)
-    penalty_drop_node: Optional[int] = Field(default=None, ge=0)
-    penalty_mix_sector: Optional[int] = Field(default=None, ge=0)
-    span_cost_coefficient: Optional[int] = Field(default=None, ge=0, le=500)
-    costo_por_ot_externo: Optional[int] = Field(default=None, ge=0)
-    umbral_ots_sector_interno: Optional[int] = Field(default=None, ge=0, le=100)
-    penalty_externo_sector_interno: Optional[int] = Field(default=None, ge=0)
-    solver_time_limit_seconds: Optional[int] = Field(default=None, ge=1, le=120)
-    usar_osrm: Optional[bool] = None
-    usar_geocoding: Optional[bool] = None
-    geocoding_max_segundos: Optional[int] = Field(default=None, ge=0, le=600)
+def _campo_configuracion(p: Dict[str, Any]) -> tuple:
+    """Campo opcional del request de configuracion, con el tipo y los limites del catalogo de parametros."""
+    limites = {"ge": p["minimo"], "le": p["maximo"]}
+    if p["tipo"] == "dict_int":
+        return Optional[Dict[str, Annotated[int, Field(**limites)]]], Field(default=None, description=p["descripcion"])
+    if p["tipo"] == "bool":
+        return Optional[bool], Field(default=None, description=p["descripcion"])
+    tipo = int if p["tipo"] == "int" else float
+    return Optional[tipo], Field(default=None, description=p["descripcion"], **limites)
+
+
+# Se genera desde optimizador.PARAMETROS: una sola fuente para valores por defecto, limites y documentacion
+ConfiguracionVRPRequest = create_model(
+    "ConfiguracionVRPRequest", **{p["clave"]: _campo_configuracion(p) for p in optimizador.PARAMETROS})
 
 # =============================================================================
 # DASHBOARD
@@ -347,6 +344,7 @@ def regenerar_datos(body: Optional[RegenerarDatosRequest] = None):
     """
     body = body or RegenerarDatosRequest()
     DB_RUTAS_PLANIFICADAS.clear()
+    DB_PENDIENTES.clear()
     generar_datos_locales(body.num_tecnicos, body.num_ordenes, body.dias_disponibilidad)
 
     externa = None
@@ -433,6 +431,12 @@ def asignaciones_masivas(body: AsignacionesMasivasRequest):
     for ruta in rutas_dia.values():
         ruta["paradas"].sort(key=lambda p: p.get("secuencia") or 0)
         ruta["total_ots"] = len(ruta["paradas"])
+
+    # Las OTs asignadas manualmente dejan de estar pendientes
+    pendientes = DB_PENDIENTES.get(fecha)
+    if pendientes:
+        asignadas = {a.ot_id for a in body.asignaciones}
+        pendientes[:] = [d for d in pendientes if d["ot_id"] not in asignadas]
 
     return {
         "status": "success",
@@ -552,7 +556,14 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     - Sin `tecnicos`/`ordenes`: se obtienen de la API externa.
     - Con `tecnicos` y/o `ordenes`: se usan los del request; lo que falte se completa desde la API.
     - `aplicar_cambios=true`: asigna los tecnicos en la API externa (OTs inexistentes alla se omiten).
+    - `aplicar_cambios` y `tiempo_limite_segundos` omitidos: se toman de la configuracion.
+
+    Cada OT sin asignar viene en `diagnosticos` con su causa clasificada (`causa_principal` y `causas`).
     """
+    maximo = optimizador.obtener_configuracion()["solver_time_limit_max_seconds"]
+    if body.tiempo_limite_segundos and body.tiempo_limite_segundos > maximo:
+        raise HTTPException(status_code=422, detail=f"tiempo_limite_segundos no puede superar {maximo} "
+                                                    f"(parametro solver_time_limit_max_seconds).")
     tecnicos = [t.model_dump() for t in body.tecnicos] if body.tecnicos is not None else None
     ordenes = [o.model_dump() for o in body.ordenes] if body.ordenes is not None else None
     parametros = dict(fecha=body.fecha, tiempo_limite_segundos=body.tiempo_limite_segundos, api_base_url=EXTERNAL_API_BASE)
@@ -577,12 +588,38 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
         rutas = {r["tecnico_id"]: r for r in resultado["rutas"]}
         DB_RUTAS_PLANIFICADAS[resultado["fecha"]] = rutas
         DB_RUTAS_PLANIFICADAS["default"] = rutas
+        pendientes = list(resultado["diagnosticos"])
+        DB_PENDIENTES[resultado["fecha"]] = pendientes
+        DB_PENDIENTES["default"] = pendientes
     return resultado
+
+
+@app.get("/api/optimizador/pendientes", tags=["Optimizador"], summary="OTs no asignadas y sus razones")
+def get_pendientes(fecha: Optional[str] = None):
+    """OTs que la optimizacion no pudo asignar, con su causa clasificada. Sin fecha: las de la ultima optimizacion."""
+    return DB_PENDIENTES.get(fecha or "default", [])
+
+
+@app.get("/api/optimizador/modelo", tags=["Optimizador"], summary="Declaracion del modelo de optimizacion")
+def get_modelo_optimizador():
+    """Variables, funcion objetivo, restricciones (implementadas y fuera de esta version) y causas de no asignacion."""
+    return optimizador.describir_modelo()
 
 
 @app.get("/api/optimizador/configuracion", tags=["Optimizador"], summary="Consultar parametros del optimizador")
 def get_configuracion_optimizador():
     return optimizador.obtener_configuracion()
+
+
+@app.get("/api/optimizador/configuracion/parametros", tags=["Optimizador"],
+         summary="Catalogo documentado de parametros (para construir el panel de configuracion)")
+def get_catalogo_parametros():
+    """
+    Cada parametro con etiqueta, descripcion, tipo, unidad, limites, valor por defecto y actual, y su
+    clasificacion: `ambito` (negocio | solver | servicio) y `origen` (operacion_cliente | supuesto_equipo).
+    Incluye tambien los parametros propios de cada corrida (`parametros_ejecucion`).
+    """
+    return optimizador.obtener_catalogo_parametros()
 
 
 @app.put("/api/optimizador/configuracion", tags=["Optimizador"], summary="Modificar parametros del optimizador")
