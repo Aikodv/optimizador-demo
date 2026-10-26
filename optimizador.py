@@ -136,9 +136,9 @@ PARAMETROS: List[Dict[str, Any]] = [
     # --- Servicios externos ---
     _p("usar_osrm", True, "bool", "servicios_externos", "servicio", "supuesto_equipo", "Usar distancias viales (OSRM)",
        "false: la matriz se calcula siempre con la estimacion de respaldo (linea recta x sinuosidad)."),
-    _p("max_nodos_osrm", 100, "int", "servicios_externos", "servicio", "supuesto_equipo", "Maximo de puntos para OSRM",
-       "Sobre este numero de puntos (tecnicos + OTs) se usa la matriz de respaldo: limite practico del servidor "
-       "publico de OSRM.", "puntos", 2, 1000),
+    _p("max_nodos_osrm", 100, "int", "servicios_externos", "servicio", "supuesto_equipo", "Maximo de puntos por consulta a OSRM",
+       "Limite practico del servidor publico de OSRM. Con mas puntos distintos (tecnicos + OTs) la matriz se pide "
+       "por bloques.", "puntos", 2, 1000),
     _p("usar_geocoding", True, "bool", "servicios_externos", "servicio", "supuesto_equipo", "Geocodificar direcciones",
        "false: las OTs sin coordenadas quedan sin asignar (causa de georreferencia)."),
     _p("geocoding_max_segundos", 60, "int", "servicios_externos", "servicio", "supuesto_equipo",
@@ -406,31 +406,71 @@ def generar_matrices_haversine(coords: List[Tuple[float, float]], cfg: Dict[str,
     return dist, tiempo
 
 
+MAX_SOLICITUDES_OSRM = 16  # Tope de consultas /table por corrida cuando la matriz se pide por bloques
+
+
 def obtener_matrices_osrm(
     coords: List[Tuple[float, float]],
     cfg: Dict[str, Any],
     session: Optional[requests.Session] = None,
-) -> Tuple[List[List[int]], List[List[int]], str]:
-    """Matrices desde OSRM; las celdas sin ruta (o todo, si OSRM falla) se completan con Haversine."""
+) -> Tuple[List[List[int]], List[List[int]], str, Optional[str]]:
+    """
+    Matrices desde OSRM: (distancia, tiempo, fuente, aviso). Las celdas sin ruta (o todo, si OSRM falla)
+    se completan con Haversine. Se consultan solo los puntos distintos (bases de una misma comuna y OTs
+    en la misma direccion se repiten) y, si superan max_nodos_osrm, la matriz se pide por bloques de
+    origenes x destinos. fuente: 'osrm', 'osrm_parcial' (algun bloque fallo) o 'haversine'.
+    """
     dist, tiempo = generar_matrices_haversine(coords, cfg)
-    coords_str = ";".join(f"{lon},{lat}" for lat, lon in coords)
-    print(f"   [INFO] Solicitando matriz a OSRM para {len(coords)} puntos...")
+    unicos = list(dict.fromkeys(coords))
+    por_solicitud = int(cfg.get("max_nodos_osrm", 100))
+    tam = len(unicos) if len(unicos) <= por_solicitud else max(1, por_solicitud // 2)
+    bloques = [list(range(i, min(i + tam, len(unicos)))) for i in range(0, len(unicos), tam)]
+    if len(bloques) ** 2 > MAX_SOLICITUDES_OSRM:
+        return dist, tiempo, "haversine", (f"{len(unicos)} puntos distintos requieren mas de {MAX_SOLICITUDES_OSRM} "
+                                           f"consultas al servicio de ruteo")
+
+    print(f"   [INFO] Solicitando matriz a OSRM: {len(unicos)} puntos distintos en {len(bloques) ** 2} consulta(s)...")
     client = session or requests
-    try:
-        res = client.get(f"{OSRM_TABLE_URL}/{coords_str}", params={"annotations": "distance,duration"}, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        if data.get("code") == "Ok":
-            for i, (fila_t, fila_d) in enumerate(zip(data["durations"], data["distances"])):
-                for j, (t, d) in enumerate(zip(fila_t, fila_d)):
-                    if i != j and t is not None and d is not None:
-                        tiempo[i][j] = max(1, int(round(t / 60.0)))
-                        dist[i][j] = int(round(d))
-            return dist, tiempo, "osrm"
-        print(f"   [WARNING] OSRM respondio code={data.get('code')}; usando Haversine.")
-    except (requests.RequestException, ValueError, KeyError, TypeError) as e:
-        print(f"   [WARNING] OSRM no disponible ({e}); usando Haversine.")
-    return dist, tiempo, "haversine"
+    vial_t: Dict[Tuple[int, int], float] = {}
+    vial_d: Dict[Tuple[int, int], float] = {}
+    consultas_ok = 0
+    for origenes, destinos in ((o, d) for o in bloques for d in bloques):
+        puntos = origenes if origenes is destinos else origenes + destinos
+        params = {"annotations": "distance,duration"}
+        if origenes is not destinos:
+            params["sources"] = ";".join(str(k) for k in range(len(origenes)))
+            params["destinations"] = ";".join(str(k) for k in range(len(origenes), len(puntos)))
+        coords_str = ";".join(f"{unicos[k][1]},{unicos[k][0]}" for k in puntos)
+        try:
+            res = client.get(f"{OSRM_TABLE_URL}/{coords_str}", params=params, timeout=15)
+            res.raise_for_status()
+            data = res.json()
+            if data.get("code") != "Ok":
+                raise ValueError(f"code={data.get('code')}")
+            for a, (fila_t, fila_d) in enumerate(zip(data["durations"], data["distances"])):
+                for b, (t, d) in enumerate(zip(fila_t, fila_d)):
+                    if t is not None and d is not None:
+                        vial_t[origenes[a], destinos[b]] = t
+                        vial_d[origenes[a], destinos[b]] = d
+            consultas_ok += 1
+        except (requests.RequestException, ValueError, KeyError, TypeError) as e:
+            # Si una consulta falla lo mas probable es que el servicio este caido: no se insiste
+            print(f"   [WARNING] OSRM no disponible ({e}); el resto de la matriz usa Haversine.")
+            break
+
+    indice = {c: k for k, c in enumerate(unicos)}
+    for i, ci in enumerate(coords):
+        for j, cj in enumerate(coords):
+            par = (indice[ci], indice[cj])
+            if par[0] != par[1] and par in vial_t:
+                tiempo[i][j] = max(1, int(round(vial_t[par] / 60.0)))
+                dist[i][j] = int(round(vial_d[par]))
+
+    if consultas_ok == len(bloques) ** 2:
+        return dist, tiempo, "osrm", None
+    if consultas_ok:
+        return dist, tiempo, "osrm_parcial", "el servicio de ruteo vial no respondio todas las consultas"
+    return dist, tiempo, "haversine", "el servicio de ruteo vial no respondio"
 
 
 def alertas_radio_operacional(
@@ -543,19 +583,14 @@ def preparar_modelo_datos(
 
     # Matrices: distancias viales (OSRM) con respaldo en linea recta x factor de sinuosidad
     coords = coords_bases + coords_ots
-    max_nodos = int(cfg.get("max_nodos_osrm", 100))
     if not cfg.get("usar_osrm", True):
         dist, tiempo = generar_matrices_haversine(coords, cfg)
         fuente = "haversine"
-    elif len(coords) > max_nodos:
-        dist, tiempo = generar_matrices_haversine(coords, cfg)
-        fuente = "haversine"
-        alertas.append(f"Matriz de distancias estimada (respaldo): {len(coords)} puntos superan el maximo de "
-                       f"{max_nodos} del servicio de ruteo.")
     else:
-        dist, tiempo, fuente = obtener_matrices_osrm(coords, cfg, session)
-        if fuente != "osrm":
-            alertas.append("Matriz de distancias estimada (respaldo): el servicio de ruteo vial no respondio.")
+        dist, tiempo, fuente, aviso = obtener_matrices_osrm(coords, cfg, session)
+        if aviso:
+            alcance = "parcialmente estimada" if fuente == "osrm_parcial" else "estimada"
+            alertas.append(f"Matriz de distancias {alcance} (respaldo): {aviso}.")
 
     # Tiempos de servicio
     tiempos_cfg = cfg.get("tiempos_servicio_por_tipo", {})

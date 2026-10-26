@@ -111,10 +111,14 @@ pasa al siguiente; si ninguno la ubica, la OT queda pendiente con su causa y el 
 ## 4. Matriz de distancias
 
 - **Principal:** distancias y tiempos viales de OSRM (`fuente_matriz = "osrm"`).
+- **Consulta:** se piden solo los puntos distintos (técnicos de una misma comuna u OTs en la misma
+  dirección comparten punto). Si superan `max_nodos_osrm`, la matriz se pide por bloques de orígenes ×
+  destinos (hasta 16 consultas). Medido con los datos de la API (11 técnicos, 90 OTs): con la matriz
+  vial se asignan 54 OTs en vez de 50, y ninguna ruta excede la jornada con tiempos reales.
 - **Respaldo:** línea recta × `factor_sinuosidad_vial`, con tiempos a `velocidad_promedio_kmh`
-  (`fuente_matriz = "haversine"`). Se usa cuando OSRM no responde, cuando hay más puntos que
-  `max_nodos_osrm` o cuando `usar_osrm` es `false`. Las celdas que OSRM devuelve sin ruta también se
-  completan con el respaldo.
+  (`fuente_matriz = "haversine"`). Se usa cuando OSRM no responde, cuando harían falta más de 16
+  consultas o cuando `usar_osrm` es `false`. Si solo algunos bloques fallan, `fuente_matriz =
+  "osrm_parcial"`. Las celdas que OSRM devuelve sin ruta también se completan con el respaldo.
 
 La fuente usada viene en `resumen.fuente_matriz`; cuando se cae al respaldo sin haberlo pedido, se
 agrega además una alerta.
@@ -199,4 +203,8 @@ direcciones, en `geocoding.py` y `optimizador.py`.
   consultas a cada geocodificador (política de uso de los servicios públicos).
 - Radios de validación de un resultado de geocodificación (10 km sin comuna informada, 3 km en comuna
   limítrofe) y 30 días para reintentar una dirección no encontrada.
-- Estrategias iniciales y metaheurística del solver.
+- Estrategias iniciales y metaheurística del solver. Se compararon con igual tiempo de búsqueda
+  (6 instancias de 40 a 100 OTs) contra PCI, PCA o SAVINGS solos, Tabu Search, Simulated Annealing y
+  "mejor solución inicial + GLS": ninguna mejora de forma consistente (diferencias de 0 a 3 OTs que se
+  invierten entre instancias) y Simulated Annealing es claramente peor; se mantiene PCA + PCI con GLS.
+- Máximo de 16 consultas a OSRM por corrida al pedir la matriz por bloques.
