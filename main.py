@@ -274,8 +274,6 @@ class OrdenInput(BaseModel):
 
 class EjecutarOptimizacionRequest(BaseModel):
     fecha: Optional[str] = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
-    aplicar_cambios: Optional[bool] = Field(
-        default=None, description="Por defecto usa aplicar_cambios_por_defecto de la configuracion.")
     tiempo_limite_segundos: Optional[int] = Field(
         default=None, ge=1, description="Por defecto se calcula segun la cantidad de OTs (parametros solver_* de la "
                                         "configuracion). Maximo: solver_time_limit_max_seconds.")
@@ -283,6 +281,15 @@ class EjecutarOptimizacionRequest(BaseModel):
         default=None, description="Si se envian, se usan en vez de consultar la API externa (se asumen disponibles).")
     ordenes: Optional[List[OrdenInput]] = Field(
         default=None, description="Si se envian, se usan en vez de consultar las OTs por_asignar de la API externa.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def rechazar_aplicar_cambios(cls, datos: Any):
+        # Un cliente antiguo que pida aplicar no debe creer que se asigno: se rechaza en vez de ignorarlo
+        if isinstance(datos, dict) and "aplicar_cambios" in datos:
+            raise ValueError("'aplicar_cambios' ya no existe: el optimizador solo propone rutas y la "
+                             "asignacion se realiza cuando la planificadora confirma.")
+        return datos
 
     @model_validator(mode="after")
     def validar_ids_unicos(self):
@@ -509,13 +516,9 @@ def probar_geocoding(direccion: str = Query(..., min_length=3), comuna: Optional
     cache = geocoding.cargar_cache()
     resultado = geocoding.geocodificar_direccion(direccion, comuna_norm, cache=cache)
     geocoding.guardar_cache(cache)
-    if not resultado and comuna_norm:
-        lat, lon, _ = geocoding.cargar_coordenadas_comunas()[comuna_norm]
-        resultado = {"lat": lat, "lon": lon, "precision": "comuna", "fuente": "centroide"}
     return {
         "interpretacion": {"calle": calle, "numero": numero, "comuna": comuna_norm},
-        "resultado": resultado or {"precision": "aproximada", "lat": geocoding.COORD_DEFAULT[0],
-                                   "lon": geocoding.COORD_DEFAULT[1], "fuente": "default"},
+        "resultado": resultado or {"precision": "sin_ubicacion", "lat": None, "lon": None, "fuente": None},
     }
 
 
@@ -555,14 +558,15 @@ def get_geometria_ruta(coordenadas: str = Query(..., description="Pares lon,lat 
 @app.post("/api/optimizador/ejecutar", tags=["Optimizador"], summary="Ejecutar optimizacion")
 def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     """
-    Ejecuta el optimizador VRP.
+    Ejecuta el optimizador VRP y retorna la propuesta de rutas. No asigna tecnicos: la asignacion
+    se realiza solo cuando la planificadora confirma la propuesta.
 
     - Sin `tecnicos`/`ordenes`: se obtienen de la API externa.
     - Con `tecnicos` y/o `ordenes`: se usan los del request; lo que falte se completa desde la API.
-    - `aplicar_cambios=true`: asigna los tecnicos en la API externa (OTs inexistentes alla se omiten).
-    - `aplicar_cambios` y `tiempo_limite_segundos` omitidos: se toman de la configuracion.
+    - `tiempo_limite_segundos` omitido: se calcula con la configuracion.
 
     Cada OT sin asignar viene en `diagnosticos` con su causa clasificada (`causa_principal` y `causas`).
+    Una OT sin ubicacion nunca se rutea: queda en `diagnosticos` con causa `georreferencia`.
     """
     maximo = optimizador.obtener_configuracion()["solver_time_limit_max_seconds"]
     if body.tiempo_limite_segundos and body.tiempo_limite_segundos > maximo:
@@ -572,8 +576,7 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     ordenes = [o.model_dump() for o in body.ordenes] if body.ordenes is not None else None
     parametros = dict(fecha=body.fecha, tiempo_limite_segundos=body.tiempo_limite_segundos, api_base_url=EXTERNAL_API_BASE)
 
-    resultado = optimizador.optimizar_jornada(aplicar_cambios=body.aplicar_cambios, tecnicos=tecnicos,
-                                              ordenes=ordenes, **parametros)
+    resultado = optimizador.optimizar_jornada(tecnicos=tecnicos, ordenes=ordenes, **parametros)
 
     if resultado.get("status") == "error_api":
         # Mismo respaldo que el dashboard: optimizar los datos simulados locales
@@ -584,9 +587,9 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
         if tecnicos is None:
             ids = {d["tecnico_id"] for d in DB_DISPONIBILIDADES if d["fecha"] == fecha_local and d["disponible"]}
             tecnicos = [t for t in DB_TECNICOS if t["id"] in ids]
-        resultado = optimizador.optimizar_jornada(aplicar_cambios=False, tecnicos=tecnicos, ordenes=ordenes, **parametros)
+        resultado = optimizador.optimizar_jornada(tecnicos=tecnicos, ordenes=ordenes, **parametros)
         resultado.setdefault("alertas", []).insert(
-            0, "API externa no disponible: se optimizaron los datos simulados locales (cambios no aplicados).")
+            0, "API externa no disponible: se optimizaron los datos simulados locales.")
 
     if resultado.get("status") == "success":
         rutas = {r["tecnico_id"]: r for r in resultado["rutas"]}
@@ -628,7 +631,10 @@ def get_catalogo_parametros():
 
 @app.put("/api/optimizador/configuracion", tags=["Optimizador"], summary="Modificar parametros del optimizador")
 def update_configuracion_optimizador(body: ConfiguracionVRPRequest):
-    cfg = optimizador.actualizar_configuracion(body.model_dump(exclude_unset=True))
+    try:
+        cfg = optimizador.actualizar_configuracion(body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return {"status": "success", "mensaje": "Parametros del optimizador actualizados.", "configuracion": cfg}
 
 

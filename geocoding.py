@@ -3,11 +3,11 @@
 # =============================================================================
 #
 # Resolucion por OT, de mejor a peor precision:
-#   original   -> la OT ya trae coordenadas validas
-#   numero     -> OSM tiene la direccion con su numero
-#   calle      -> se encontro la calle dentro de la comuna (sin el numero exacto)
-#   comuna     -> centroide de la comuna (direccion no encontrada)
-#   aproximada -> ni la comuna se reconoce: Santiago Centro
+#   original      -> la OT ya trae coordenadas validas
+#   numero        -> OSM tiene la direccion con su numero
+#   calle         -> se encontro la calle dentro de la comuna (sin el numero exacto)
+#   sin_ubicacion -> la direccion no se pudo ubicar: la OT queda sin coordenadas.
+#                    Nunca se le supone una ubicacion (ni el centro de su comuna).
 #
 # Cada resultado de los geocodificadores se valida contra la comuna y la calle
 # pedidas: OSM devuelve con frecuencia una calle homonima en otra comuna
@@ -40,7 +40,7 @@ USER_AGENT = "optimizador-rutas-chile/4.1"
 # Bounding box de Chile
 LAT_MIN, LAT_MAX = -56.5, -17.5
 LON_MIN, LON_MAX = -75.6, -66.5
-COORD_DEFAULT = (-33.4372, -70.6572)  # Santiago Centro, ultimo recurso
+COORD_DEFAULT = (-33.4372, -70.6572)  # Santiago Centro, ultimo recurso para la base de un tecnico (nunca para una OT)
 
 CACHE_VERSION = 2
 DIAS_REINTENTO_NO_ENCONTRADA = 30
@@ -429,28 +429,32 @@ def resolver_coordenadas_ordenes(
     usar_geocoding: bool = True,
     max_segundos: float = 60,
     session: Optional[requests.Session] = None,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[str], Dict[int, str]]:
     """
-    Completa latitud/longitud de cada OT (las modifica). Retorna (precision por OT, cantidad de OTs
-    que no alcanzaron a geocodificarse por el limite de tiempo; se resuelven en ejecuciones futuras).
+    Completa latitud/longitud de cada OT (las modifica; quedan en None si no se pudo ubicar). Retorna
+    (precision por OT, motivo por indice de cada OT 'sin_ubicacion'). Motivos: 'sin_direccion',
+    'geocoding_desactivado', 'sin_tiempo' (no alcanzo a geocodificarse; se resolvera en una proxima
+    ejecucion) y 'no_encontrada'.
     """
-    comunas = cargar_coordenadas_comunas()
     cache = cargar_cache()
     cache_inicial = dict(cache)
     limite = time.monotonic() + max_segundos
     precisiones: List[str] = []
-    sin_tiempo = 0
+    motivos: Dict[int, str] = {}
 
-    for ot in ordenes:
+    for i, ot in enumerate(ordenes):
         if coordenada_valida(ot.get("latitud"), ot.get("longitud")):
             ot["latitud"], ot["longitud"] = float(ot["latitud"]), float(ot["longitud"])
             precisiones.append("original")
             continue
 
         direccion = (ot.get("direccion_instalacion") or "").strip()
-        comuna = resolver_comuna_ot(ot)
-
-        if usar_geocoding and direccion:
+        if not direccion:
+            motivos[i] = "sin_direccion"
+        elif not usar_geocoding:
+            motivos[i] = "geocoding_desactivado"
+        else:
+            comuna = resolver_comuna_ot(ot)
             entrada = cache.get(clave_cache(direccion, comuna))
             if _entrada_vigente(entrada) or time.monotonic() < limite:
                 r = geocodificar_direccion(direccion, comuna, session, cache)
@@ -458,16 +462,13 @@ def resolver_coordenadas_ordenes(
                     ot["latitud"], ot["longitud"] = r["lat"], r["lon"]
                     precisiones.append(r["precision"])
                     continue
+                motivos[i] = "no_encontrada"
             else:
-                sin_tiempo += 1  # Tiempo agotado y no esta en cache: se resolvera en una proxima ejecucion
+                motivos[i] = "sin_tiempo"
 
-        if comuna:
-            ot["latitud"], ot["longitud"] = comunas[comuna][:2]
-            precisiones.append("comuna")
-        else:
-            ot["latitud"], ot["longitud"] = COORD_DEFAULT
-            precisiones.append("aproximada")
+        ot["latitud"], ot["longitud"] = None, None
+        precisiones.append("sin_ubicacion")
 
     if cache != cache_inicial:
         guardar_cache(cache)
-    return precisiones, sin_tiempo
+    return precisiones, motivos

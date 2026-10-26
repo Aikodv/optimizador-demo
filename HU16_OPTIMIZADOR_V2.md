@@ -63,10 +63,10 @@ Se minimiza, en metros (las penalizaciones son metros equivalentes):
 |---|---|---|---|
 | R1 | Cada OT se visita a lo más una vez y por un solo técnico | Dura | |
 | R2 | Cada ruta parte y termina en la base del técnico | Dura | |
-| R3 | Toda la ruta ocurre dentro de la jornada | Dura | `inicio_jornada_horas`, `fin_jornada_minutos` |
+| R3 | Toda la ruta ocurre dentro de la jornada | Dura | `inicio_jornada_horas`, `fin_jornada_horas` |
 | R4 | Una OT con hora programada inicia dentro de hora ± tolerancia y termina antes del fin de jornada | Dura | `ventana_tolerancia_min`, `tiempos_servicio_por_tipo`, `tiempo_servicio_default` |
 | R5 | Cada técnico atiende como máximo su capacidad de OTs | Dura | `capacidad_max_interno`, `capacidad_max_externo` |
-| R6 | Una OT sin ubicación resoluble no se rutea | Dura (configurable) | `excluir_ots_sin_georreferencia` |
+| R6 | Una OT sin ubicación resoluble no se rutea: nunca se le supone una ubicación (HU-33) | Dura | |
 | R7 | Los sectores con más OTs que el umbral se asignan a internos | Blanda; dura si `sectores_internos_exclusivos` | `umbral_ots_sector_interno`, `penalty_externo_sector_interno` |
 | R8 | Un interno evita mezclar sectores en su ruta | Blanda | `penalty_mix_sector` |
 | R9 | Una OT puede quedar sin asignar pagando una penalización alta | Blanda | `penalty_drop_node` |
@@ -100,12 +100,13 @@ parada y de cada OT pendiente, y el conteo por nivel en `resumen.precision_ubica
 | 1 | `original` | La OT ya trae coordenadas válidas dentro de Chile |
 | 2 | `numero` | Nominatim o Photon encontraron la dirección con su número |
 | 3 | `calle` | Se encontró la calle dentro de la comuna, sin el número exacto |
-| 4 | `comuna` | Centro de la comuna (dirección no encontrada, o geocodificación desactivada o sin tiempo) |
-| 5 | `aproximada` | Tampoco se reconoce la comuna: la OT queda sin asignar por georreferencia |
+| 4 | `sin_ubicacion` | La dirección no se encontró (o la geocodificación está desactivada o sin tiempo): la OT queda sin coordenadas y sin asignar por georreferencia |
+
+Nunca se supone una ubicación (HU-33): ni el centro de la comuna ni Santiago Centro.
 
 Dentro de los niveles 2 y 3 se consulta Nominatim, luego Photon y luego Nominatim con la variante del
 prefijo "Avenida". Los resultados se guardan en `geocoding_cache.json`. Si un proveedor no responde se
-pasa al siguiente y, en último caso, al centro de la comuna: una fuente caída no impide el cálculo.
+pasa al siguiente; si ninguno la ubica, la OT queda pendiente con su causa y el resto se optimiza igual.
 
 ## 4. Matriz de distancias
 
@@ -125,7 +126,7 @@ Cada OT pendiente trae `causa_principal` (la categoría), `causas` (lista estruc
 
 | Categoría | Código | Prefijo en `razones` | Cuándo |
 |---|---|---|---|
-| `georreferencia` | `SIN_GEORREFERENCIA` | `GEORREFERENCIA:` | Sin coordenadas, dirección no geocodificable y comuna no reconocida |
+| `georreferencia` | `SIN_GEORREFERENCIA` | `GEORREFERENCIA:` | Sin coordenadas y dirección no ubicada en el mapa (el detalle indica si no se encontró, faltó tiempo, la geocodificación está desactivada o no hay dirección) |
 | `sectorial` | `SECTOR_RESERVADO_INTERNOS` | `SECTOR:` | Sector reservado a internos; un externo alcanzaba y tenía cupo, pero la regla de sector lo excluyó |
 | `temporal` | `DURACION_EXCEDE_JORNADA` | `DURACION:` | El servicio dura más que la jornada |
 | `temporal` | `HORA_FUERA_DE_JORNADA` | `HORARIO:` | La hora programada queda fuera de la jornada |
@@ -155,7 +156,7 @@ configuración vive en memoria: se pierde al reiniciar el servicio.
 | `tiempos_servicio_por_tipo` | instalación simple 45, con corte 90, mantención 40, retiro 25 min | 1 a 600 | negocio | operacion_cliente |
 | `tiempo_servicio_default` | 30 min | 1 a 600 | negocio | supuesto_equipo |
 | `inicio_jornada_horas` | 8 | 5 a 12 | negocio | operacion_cliente |
-| `fin_jornada_minutos` | 600 min | 180 a 1440 | negocio | operacion_cliente |
+| `fin_jornada_horas` | 18 | 6 a 23, posterior a `inicio_jornada_horas` | negocio | operacion_cliente |
 | `ventana_tolerancia_min` | 30 min | 0 a 240 | negocio | supuesto_equipo |
 | `capacidad_max_externo` | 8 OTs | 1 a 30 | negocio | operacion_cliente |
 | `capacidad_max_interno` | 12 OTs | 1 a 30 | negocio | operacion_cliente |
@@ -163,8 +164,6 @@ configuración vive en memoria: se pierde al reiniciar el servicio.
 | `sectores_internos_exclusivos` | false | | negocio | supuesto_equipo |
 | `costo_por_ot_externo` | 0 m | 0 o más | negocio | supuesto_equipo |
 | `max_radio_operacional_km` | 80 km | 10 a 300 | negocio | supuesto_equipo |
-| `excluir_ots_sin_georreferencia` | true | | negocio | supuesto_equipo |
-| `aplicar_cambios_por_defecto` | false | | negocio | supuesto_equipo |
 | `factor_sinuosidad_vial` | 1.30 | 1 a 3 | solver | supuesto_equipo |
 | `velocidad_promedio_kmh` | 30 km/h | 10 a 120 | solver | supuesto_equipo |
 | `penalty_drop_node` | 10 000 000 m | 0 o más | solver | supuesto_equipo |
@@ -184,10 +183,12 @@ configuración vive en memoria: se pierde al reiniciar el servicio.
 | Campo | Si se omite | Ámbito |
 |---|---|---|
 | `fecha` | Fecha programada más temprana entre las OTs por asignar | negocio |
-| `aplicar_cambios` | `aplicar_cambios_por_defecto` | negocio |
 | `tiempo_limite_segundos` | Automático: `OTs × solver_segundos_por_ot`, entre `solver_time_limit_seconds` y `solver_time_limit_max_seconds` | solver |
 
 La respuesta incluye `parametros_corrida` con los valores efectivamente usados y la configuración vigente.
+
+La corrida solo propone rutas: nunca asigna técnicos. La asignación ocurre cuando la planificadora
+presiona "Confirmar" (HU-33). Un request que envíe `aplicar_cambios` se rechaza con HTTP 422.
 
 ### Constantes que siguen fijas en el código
 

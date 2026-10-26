@@ -306,10 +306,10 @@
             </div>
 
             <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
-              <label class="text-[10px] text-slate-400 font-semibold">Duración Máx Jornada</label>
+              <label class="text-[10px] text-slate-400 font-semibold">Fin Jornada</label>
               <div class="flex items-center gap-1.5">
-                <input type="number" id="cfg-fin-jornada" min="180" max="900" step="30" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
-                <span class="text-[10px] text-slate-500">min</span>
+                <input type="number" id="cfg-fin-jornada" min="7" max="23" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">:00 hrs</span>
               </div>
             </div>
 
@@ -651,7 +651,7 @@
       document.getElementById('cfg-st-retiro').value = st.retiro || 25;
 
       document.getElementById('cfg-inicio-jornada').value = cfg.inicio_jornada_horas || 8;
-      document.getElementById('cfg-fin-jornada').value = cfg.fin_jornada_minutos || 600;
+      document.getElementById('cfg-fin-jornada').value = cfg.fin_jornada_horas || 18;
       document.getElementById('cfg-cap-interno').value = cfg.capacidad_max_interno || 12;
       document.getElementById('cfg-cap-externo').value = cfg.capacidad_max_externo || 8;
 
@@ -673,7 +673,7 @@
           retiro: parseInt(document.getElementById('cfg-st-retiro').value),
         },
         inicio_jornada_horas: parseInt(document.getElementById('cfg-inicio-jornada').value),
-        fin_jornada_minutos: parseInt(document.getElementById('cfg-fin-jornada').value),
+        fin_jornada_horas: parseInt(document.getElementById('cfg-fin-jornada').value),
         capacidad_max_interno: parseInt(document.getElementById('cfg-cap-interno').value),
         capacidad_max_externo: parseInt(document.getElementById('cfg-cap-externo').value),
         factor_sinuosidad_vial: parseFloat(document.getElementById('cfg-sinuosidad').value),
@@ -690,6 +690,9 @@
           body: JSON.stringify(nuevoPayload)
         });
         const data = await res.json();
+        if (!res.ok) {
+          throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+        }
         currentConfig = data.configuracion;
         cerrarModalConfiguracion();
         mostrarToast("Parámetros VRP actualizados con éxito", "fa-circle-check", "text-emerald-400");
@@ -1170,7 +1173,7 @@
         const res = await fetch(`${API_BASE}/optimizador/ejecutar`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ aplicar_cambios: false })
+          body: JSON.stringify({})
         });
         const result = await res.json();
         if (!res.ok || result.status !== 'success') {

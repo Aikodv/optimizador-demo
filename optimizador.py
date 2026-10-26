@@ -7,7 +7,9 @@
 #   2. Transformacion:  coordenadas, matrices distancia/tiempo, ventanas, sectores
 #   3. Optimizacion:    VRP con ventanas horarias, capacidad y sectores (OR-Tools)
 #   4. Resultado:       hojas de ruta, diagnostico de OTs pendientes y alertas
-#   5. Aplicacion:      (opcional) asignacion de tecnicos en la API externa
+#
+# El optimizador solo propone rutas: nunca asigna tecnicos. La asignacion la hace
+# la planificadora al confirmar la propuesta.
 #
 # Convencion: todas las coordenadas internas se manejan como (lat, lon).
 # =============================================================================
@@ -71,9 +73,9 @@ PARAMETROS: List[Dict[str, Any]] = [
     # --- Jornada ---
     _p("inicio_jornada_horas", 8, "int", "jornada", "negocio", "operacion_cliente", "Inicio de jornada",
        "Hora del dia en que los tecnicos salen de su base (minuto 0 del modelo).", "hora del dia", 5, 12),
-    _p("fin_jornada_minutos", 600, "int", "jornada", "negocio", "operacion_cliente", "Duracion de la jornada",
-       "Minutos desde el inicio de jornada en que el tecnico debe estar de vuelta en su base (600 = 10 horas).",
-       "min", 180, 1440),
+    _p("fin_jornada_horas", 18, "int", "jornada", "negocio", "operacion_cliente", "Fin de jornada",
+       "Hora del dia en que el tecnico debe estar de vuelta en su base. Debe ser posterior al inicio de jornada.",
+       "hora del dia", 6, 23),
     _p("ventana_tolerancia_min", 30, "int", "jornada", "negocio", "supuesto_equipo", "Tolerancia de la hora acordada",
        "Minutos antes/despues de la hora programada en que se permite iniciar el servicio.", "min", 0, 240),
 
@@ -98,12 +100,6 @@ PARAMETROS: List[Dict[str, Any]] = [
     _p("max_radio_operacional_km", 80.0, "float", "sectores", "negocio", "supuesto_equipo", "Radio operacional",
        "Distancia desde el centroide de las bases sobre la cual una OT genera alerta (no impide asignarla).",
        "km", 10.0, 300.0),
-
-    # --- Georreferencia ---
-    _p("excluir_ots_sin_georreferencia", True, "bool", "georreferencia", "negocio", "supuesto_equipo",
-       "No rutear OTs sin ubicacion",
-       "true: una OT sin coordenadas, cuya direccion no se pudo geocodificar y sin comuna reconocible, queda sin "
-       "asignar con causa de georreferencia. false: se rutea hacia Santiago Centro (ruta poco confiable)."),
 
     # --- Red vial (respaldo cuando no hay distancias de OSRM) ---
     _p("factor_sinuosidad_vial", 1.30, "float", "red_vial", "solver", "supuesto_equipo", "Factor de sinuosidad",
@@ -144,16 +140,11 @@ PARAMETROS: List[Dict[str, Any]] = [
        "Sobre este numero de puntos (tecnicos + OTs) se usa la matriz de respaldo: limite practico del servidor "
        "publico de OSRM.", "puntos", 2, 1000),
     _p("usar_geocoding", True, "bool", "servicios_externos", "servicio", "supuesto_equipo", "Geocodificar direcciones",
-       "false: las OTs sin coordenadas se ubican directamente en el centro de su comuna."),
+       "false: las OTs sin coordenadas quedan sin asignar (causa de georreferencia)."),
     _p("geocoding_max_segundos", 60, "int", "servicios_externos", "servicio", "supuesto_equipo",
        "Tiempo maximo de geocodificacion por corrida",
-       "Las direcciones nuevas que no alcancen (~3 s cada una) usan el centro de la comuna y se resuelven en la "
-       "proxima corrida.", "s", 0, 600),
-
-    # --- Ejecucion ---
-    _p("aplicar_cambios_por_defecto", False, "bool", "ejecucion", "negocio", "supuesto_equipo",
-       "Aplicar asignaciones automaticamente",
-       "Valor de aplicar_cambios cuando la corrida no lo indica: true asigna los tecnicos en la API de ordenes."),
+       "Las direcciones nuevas que no alcancen (~3 s cada una) quedan sin asignar en esta corrida y se resuelven "
+       "en la proxima.", "s", 0, 600),
 ]
 
 DEFAULT_CONFIG_VRP: Dict[str, Any] = {p["clave"]: p["default"] for p in PARAMETROS}
@@ -172,15 +163,10 @@ def obtener_catalogo_parametros() -> Dict[str, Any]:
     ejecucion = [
         _p("fecha", None, "str", "ejecucion", "negocio", "operacion_cliente", "Fecha a planificar",
            "YYYY-MM-DD. Sin valor se usa la fecha programada mas temprana entre las OTs por asignar."),
-        _p("aplicar_cambios", None, "bool", "ejecucion", "negocio", "supuesto_equipo", "Aplicar asignaciones",
-           "true asigna los tecnicos en la API de ordenes; false solo propone las rutas. Sin valor se usa "
-           "aplicar_cambios_por_defecto de la configuracion."),
         _p("tiempo_limite_segundos", None, "int", "ejecucion", "solver", "supuesto_equipo", "Tiempo de busqueda",
            "Sin valor (recomendado) se calcula segun la cantidad de OTs con los parametros solver_* de la configuracion.",
            "s", 1, cfg["solver_time_limit_max_seconds"]),
     ]
-    for p in ejecucion:
-        p["default_efectivo"] = cfg["aplicar_cambios_por_defecto"] if p["clave"] == "aplicar_cambios" else None
     return {
         "ambitos": AMBITOS,
         "origenes": ORIGENES,
@@ -190,14 +176,23 @@ def obtener_catalogo_parametros() -> Dict[str, Any]:
 
 
 def actualizar_configuracion(nuevos_valores: Dict[str, Any]) -> Dict[str, Any]:
-    """Actualiza parametros existentes del optimizador (claves desconocidas se ignoran)."""
+    """
+    Actualiza parametros existentes del optimizador (claves desconocidas se ignoran).
+    ValueError si la configuracion resultante es inconsistente; en ese caso no se modifica nada.
+    """
+    global CONFIG_VRP
+    cfg = obtener_configuracion()
     for k, v in nuevos_valores.items():
-        if k not in CONFIG_VRP or v is None:
+        if k not in cfg or v is None:
             continue
-        if isinstance(CONFIG_VRP[k], dict) and isinstance(v, dict):
-            CONFIG_VRP[k].update(v)
+        if isinstance(cfg[k], dict) and isinstance(v, dict):
+            cfg[k].update(v)
         else:
-            CONFIG_VRP[k] = v
+            cfg[k] = v
+    if cfg["fin_jornada_horas"] <= cfg["inicio_jornada_horas"]:
+        raise ValueError(f"El fin de jornada ({cfg['fin_jornada_horas']}:00) debe ser posterior al inicio "
+                         f"({cfg['inicio_jornada_horas']}:00).")
+    CONFIG_VRP = cfg
     print("   [CONFIG] Parametros VRP actualizados en memoria.")
     return obtener_configuracion()
 
@@ -215,7 +210,8 @@ def restaurar_configuracion() -> Dict[str, Any]:
 # Causas por las que una OT queda sin asignar: codigo -> (categoria, prefijo del texto, descripcion).
 CAUSAS: Dict[str, Tuple[str, str, str]] = {
     "SIN_GEORREFERENCIA": ("georreferencia", "GEORREFERENCIA",
-                           "La OT no tiene coordenadas, su direccion no se pudo geocodificar y su comuna no se reconoce."),
+                           "La OT no tiene coordenadas y su direccion no se pudo ubicar en el mapa (no se usa el "
+                           "centro de la comuna ni otra ubicacion supuesta)."),
     "SECTOR_RESERVADO_INTERNOS": ("sectorial", "SECTOR",
                                   "La OT es de un sector reservado a internos y la regla de sector impidio que la tomara "
                                   "un externo que si alcanzaba."),
@@ -274,7 +270,7 @@ def describir_modelo() -> Dict[str, Any]:
              "descripcion": "Cada ruta parte y termina en la base del tecnico."},
             {"codigo": "R3", "nombre": "Jornada", "tipo": "dura",
              "descripcion": "Toda la ruta (viajes, esperas y servicios) ocurre dentro de la jornada.",
-             "parametros": ["inicio_jornada_horas", "fin_jornada_minutos"]},
+             "parametros": ["inicio_jornada_horas", "fin_jornada_horas"]},
             {"codigo": "R4", "nombre": "Ventana horaria", "tipo": "dura",
              "descripcion": "Una OT con hora programada inicia dentro de hora +/- tolerancia; el servicio debe "
                             "terminar antes del fin de jornada.",
@@ -282,9 +278,8 @@ def describir_modelo() -> Dict[str, Any]:
             {"codigo": "R5", "nombre": "Capacidad", "tipo": "dura",
              "descripcion": "Cada tecnico atiende como maximo su capacidad de OTs.",
              "parametros": ["capacidad_max_interno", "capacidad_max_externo"]},
-            {"codigo": "R6", "nombre": "Georreferencia", "tipo": "dura (configurable)",
-             "descripcion": "Una OT sin ubicacion resoluble no se rutea.",
-             "parametros": ["excluir_ots_sin_georreferencia"]},
+            {"codigo": "R6", "nombre": "Georreferencia", "tipo": "dura",
+             "descripcion": "Una OT sin ubicacion resoluble no se rutea: nunca se le supone una ubicacion."},
             {"codigo": "R7", "nombre": "Sector reservado a internos", "tipo": "blanda, o dura si sectores_internos_exclusivos",
              "descripcion": "Los sectores con mas OTs que el umbral se asignan a internos.",
              "parametros": ["umbral_ots_sector_interno", "sectores_internos_exclusivos", "penalty_externo_sector_interno"]},
@@ -329,6 +324,11 @@ def minutos_desde_inicio(hora_str: Optional[str], inicio_horas: int) -> Optional
     return (h * 60 + m) - inicio_horas * 60
 
 
+def duracion_jornada_min(cfg: Dict[str, Any]) -> int:
+    """Minutos entre el inicio y el fin de jornada: el minuto en que el modelo cierra la jornada."""
+    return (int(cfg.get("fin_jornada_horas", 18)) - int(cfg.get("inicio_jornada_horas", 8))) * 60
+
+
 def minutos_a_hora_str(minutos: int, inicio_horas: int) -> str:
     """Minutos desde el inicio de jornada -> 'HH:MM'."""
     total = inicio_horas * 60 + int(minutos)
@@ -347,6 +347,18 @@ def resolver_base_tecnico(tecnico: Dict[str, Any]) -> Tuple[Tuple[float, float],
     if comuna:
         return cargar_coordenadas_comunas()[comuna][:2], "comuna"
     return COORD_DEFAULT, "aproximada"
+
+
+def detalle_sin_ubicacion(ot: Dict[str, Any], motivo: str, cfg: Dict[str, Any]) -> str:
+    """Texto de la causa SIN_GEORREFERENCIA segun por que no se pudo ubicar la OT."""
+    direccion = ot.get("direccion_instalacion") or ""
+    return {
+        "sin_direccion": "no trae coordenadas ni direccion.",
+        "geocoding_desactivado": f"no trae coordenadas y la geocodificacion esta desactivada (direccion '{direccion}').",
+        "sin_tiempo": f"no trae coordenadas y la direccion '{direccion}' no alcanzo a geocodificarse (limite de "
+                      f"{cfg.get('geocoding_max_segundos', 60)} s); se resolvera en una proxima ejecucion.",
+        "no_encontrada": f"no trae coordenadas y la direccion '{direccion}' no se encontro en el mapa.",
+    }[motivo]
 
 
 def sector_de_orden(ot: Dict[str, Any]) -> Tuple[Optional[str], str]:
@@ -510,30 +522,24 @@ def preparar_modelo_datos(
             alertas.append(f"Tecnico {t.get('id')}: zona '{t.get('zona')}' no reconocida; se usa Santiago Centro como base.")
         coords_bases.append(coord)
 
-    # Ubicacion de OTs
-    precisiones, sin_tiempo = resolver_coordenadas_ordenes(
+    # Ubicacion de OTs: una OT sin ubicacion nunca se rutea (no se le supone una)
+    precisiones, motivos = resolver_coordenadas_ordenes(
         ordenes, usar_geocoding=cfg.get("usar_geocoding", True),
         max_segundos=float(cfg.get("geocoding_max_segundos", 60)), session=session)
-    excluir_sin_geo = bool(cfg.get("excluir_ots_sin_georreferencia", True))
-    no_ruteables: Dict[int, Dict[str, str]] = {}   # OTs que se excluyen del modelo, con su causa
-    for i, (ot, precision) in enumerate(zip(ordenes, precisiones)):
-        if precision == "aproximada" and excluir_sin_geo:
-            no_ruteables[i] = _causa(
-                "SIN_GEORREFERENCIA",
-                f"no trae coordenadas, la direccion '{ot.get('direccion_instalacion') or ''}' no se pudo "
-                f"geocodificar y la comuna '{ot.get('comuna') or ''}' no se reconoce.")
-        elif precision == "aproximada":
-            alertas.append(f"OT {ot.get('id')}: ubicacion no resuelta; se usa Santiago Centro (ruta poco confiable).")
-        elif precision == "comuna":
-            alertas.append(f"OT {ot.get('id')}: direccion '{ot.get('direccion_instalacion')}' no encontrada en el mapa; "
-                           f"se usa el centro de la comuna.")
+    no_ruteables: Dict[int, Dict[str, str]] = {   # OTs que se excluyen del modelo, con su causa
+        i: _causa("SIN_GEORREFERENCIA", detalle_sin_ubicacion(ordenes[i], motivo, cfg)) for i, motivo in motivos.items()}
+    sin_tiempo = sum(1 for m in motivos.values() if m == "sin_tiempo")
     if sin_tiempo:
         alertas.append(f"{sin_tiempo} direcciones nuevas no alcanzaron a geocodificarse (limite de "
-                       f"{cfg.get('geocoding_max_segundos', 60)} s); se resolveran en las proximas ejecuciones.")
-    coords_ots = [(ot["latitud"], ot["longitud"]) for ot in ordenes]
-    con_ubicacion = [i for i in range(len(ordenes)) if i not in no_ruteables]
-    alertas += alertas_radio_operacional(coords_bases, [coords_ots[i] for i in con_ubicacion],
+                       f"{cfg.get('geocoding_max_segundos', 60)} s); quedan pendientes y se resolveran en las "
+                       f"proximas ejecuciones.")
+    con_ubicacion = [i for i, p in enumerate(precisiones) if p != "sin_ubicacion"]
+    alertas += alertas_radio_operacional(coords_bases, [(ordenes[i]["latitud"], ordenes[i]["longitud"]) for i in con_ubicacion],
                                          [ordenes[i] for i in con_ubicacion], cfg)
+    # Una OT sin ubicacion sigue siendo un nodo del modelo (asi conserva su diagnostico), pero inactivo:
+    # en la matriz ocupa la base del primer tecnico solo para completar la fila; nunca se rutea.
+    coords_ots = [(ot["latitud"], ot["longitud"]) if p != "sin_ubicacion" else coords_bases[0]
+                  for ot, p in zip(ordenes, precisiones)]
 
     # Matrices: distancias viales (OSRM) con respaldo en linea recta x factor de sinuosidad
     coords = coords_bases + coords_ots
@@ -581,7 +587,7 @@ def preparar_modelo_datos(
         sectores_internos = set()
 
     # Ventanas horarias (y OTs imposibles de rutear, que se excluyen del modelo)
-    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
+    fin_jornada = duracion_jornada_min(cfg)
     inicio_h = int(cfg.get("inicio_jornada_horas", 8))
     tolerancia = int(cfg.get("ventana_tolerancia_min", 30))
     time_windows: List[Tuple[int, int]] = [(0, fin_jornada)] * V
@@ -680,7 +686,7 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
 
     penalty_drop = int(cfg.get("penalty_drop_node", 10_000_000))
     span_coeff = int(cfg.get("span_cost_coefficient", 50))
-    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
+    fin_jornada = duracion_jornada_min(cfg)
 
     # Matrices registradas en C++ (RegisterTransitMatrix): el solver no llama a Python por cada arco,
     # lo que multiplica las iteraciones de busqueda en el mismo tiempo.
@@ -787,7 +793,7 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
 
     V = data["num_vehicles"]
     nodo = V + idx_orden
-    fin_jornada = int(cfg.get("fin_jornada_minutos", 600))
+    fin_jornada = duracion_jornada_min(cfg)
     inicio_h = int(cfg.get("inicio_jornada_horas", 8))
     tiempo = data["time_matrix"]
     st = data["service_times"][nodo]
@@ -834,7 +840,7 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
         "Prueba aumentar el tiempo del solver o la flota.")]
 
 # =============================================================================
-# 5. RESULTADO Y APLICACION EN API
+# 5. RESULTADO
 # =============================================================================
 def ahora_utc_iso() -> str:
     """Instante actual en UTC, ISO 8601 con sufijo Z (ej: 2026-10-01T14:03:27Z)."""
@@ -859,7 +865,6 @@ def _resultado_vacio(status: str, mensaje: str, fecha: Optional[str], ordenes: L
         "diagnosticos": [],
         "alertas": alertas or [],
         "rutas": [],
-        "aplicacion_cambios": {"aplicado": False},
     }
 
 
@@ -959,14 +964,13 @@ def construir_resultado(
         index = manager.NodeToIndex(V + i)
         if solution.Value(routing.NextVar(index)) == index:
             causas = diagnosticar_orden_pendiente(i, data, cfg, carga)
-            sin_ubicacion = causas[0]["codigo"] == "SIN_GEORREFERENCIA"  # Sus coordenadas son un relleno, no se informan
             diagnosticos.append({
                 "ot_id": ot["id"],
                 "tipo": ot.get("tipo"),
                 "cliente": ot.get("cliente"),
                 "direccion": ot.get("direccion_instalacion", ""),
-                "latitud": None if sin_ubicacion else ot.get("latitud"),
-                "longitud": None if sin_ubicacion else ot.get("longitud"),
+                "latitud": ot.get("latitud"),
+                "longitud": ot.get("longitud"),
                 "precision_ubicacion": data["precisiones"][i],
                 "hora_programada": ot.get("hora_programada") or "Libre",
                 "sector": data["orden_sectores_nombre"][i],
@@ -1017,40 +1021,11 @@ def construir_resultado(
     }
     return resultado, asignaciones
 
-
-def aplicar_asignaciones_api(asignaciones: List[Dict[str, Any]], client: Any, api_base_url: str) -> Dict[str, Any]:
-    """Asigna el tecnico de cada OT en la API externa. Omite las OTs que no existen alla."""
-    out: Dict[str, Any] = {"aplicado": True, "enviadas": 0, "omitidas": [], "errores": []}
-    print(f"\n5. Aplicando {len(asignaciones)} asignaciones en la API externa...")
-    try:
-        existentes = {o.get("id") for o in _get_json(client, f"{api_base_url}/ordenes")}
-    except (requests.RequestException, ValueError) as e:
-        out["errores"].append(f"No se pudo validar las OTs en la API externa: {e}")
-        return out
-
-    for a in asignaciones:
-        if a["ot_id"] not in existentes:
-            out["omitidas"].append(a["ot_id"])
-            continue
-        try:
-            res = client.patch(f"{api_base_url}/ordenes/{a['ot_id']}/tecnico",
-                               json={"tecnico_id": a["tecnico_id"],
-                                     "timestamp_asignacion_utc": a["timestamp_asignacion_utc"]}, timeout=15)
-            if res.status_code == 200:
-                out["enviadas"] += 1
-            else:
-                out["errores"].append(f"{a['ot_id']}: HTTP {res.status_code}")
-        except requests.RequestException as e:
-            out["errores"].append(f"{a['ot_id']}: {e}")
-    print(f"   [API] {out['enviadas']} aplicadas, {len(out['omitidas'])} omitidas, {len(out['errores'])} con error.")
-    return out
-
 # =============================================================================
 # FUNCION PRINCIPAL
 # =============================================================================
 def optimizar_jornada(
     fecha: Optional[str] = None,
-    aplicar_cambios: Optional[bool] = None,
     tiempo_limite_segundos: Optional[int] = None,
     api_base_url: str = API_BASE_URL,
     session: Optional[requests.Session] = None,
@@ -1058,16 +1033,16 @@ def optimizar_jornada(
     ordenes: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Ejecuta el pipeline completo. `tecnicos`/`ordenes` recibidos por parametro se usan tal cual
+    Ejecuta el pipeline completo y retorna la propuesta de rutas; no asigna tecnicos (eso ocurre
+    cuando la planificadora confirma). `tecnicos`/`ordenes` recibidos por parametro se usan tal cual
     (los tecnicos se asumen disponibles); lo que falte se obtiene de la API externa.
-    `aplicar_cambios` y `tiempo_limite_segundos` en None toman su valor de la configuracion.
+    `tiempo_limite_segundos` en None se calcula con la configuracion.
     """
     cfg = obtener_configuracion()  # Snapshot: cambios de configuracion durante la ejecucion no la afectan
-    resultado = _optimizar(cfg, fecha, aplicar_cambios, tiempo_limite_segundos, api_base_url, session, tecnicos, ordenes)
+    resultado = _optimizar(cfg, fecha, tiempo_limite_segundos, api_base_url, session, tecnicos, ordenes)
     # Parametros con los que efectivamente se resolvio (los de la corrida y la configuracion vigente)
     resultado["parametros_corrida"] = {
         "fecha": resultado.get("fecha"),
-        "aplicar_cambios": cfg["aplicar_cambios_por_defecto"] if aplicar_cambios is None else aplicar_cambios,
         "tiempo_limite_segundos": resultado.pop("_tiempo_limite_s", None),
         "tiempo_limite_origen": "corrida" if tiempo_limite_segundos else "automatico",
         "configuracion": cfg,
@@ -1078,15 +1053,12 @@ def optimizar_jornada(
 def _optimizar(
     cfg: Dict[str, Any],
     fecha: Optional[str],
-    aplicar_cambios: Optional[bool],
     tiempo_limite_segundos: Optional[int],
     api_base_url: str,
     session: Optional[requests.Session],
     tecnicos: Optional[List[Dict[str, Any]]],
     ordenes: Optional[List[Dict[str, Any]]],
 ) -> Dict[str, Any]:
-    if aplicar_cambios is None:
-        aplicar_cambios = bool(cfg["aplicar_cambios_por_defecto"])
     client = session or requests.Session()
 
     print("1. Obteniendo datos operativos...")
@@ -1115,16 +1087,8 @@ def _optimizar(
     resultado, asignaciones = construir_resultado(manager, routing, solution, tecnicos, ordenes, data, cfg, fecha_efectiva)
     resultado["_tiempo_limite_s"] = data["tiempo_limite_s"]
 
-    # Hora de asignacion: el instante (UTC) en que se entrega el resultado; el mismo valor va a la API externa
-    timestamp = ahora_utc_iso() if asignaciones else None
-    resultado["timestamp_asignacion_utc"] = timestamp
-    for a in asignaciones:
-        a["timestamp_asignacion_utc"] = timestamp
-
-    if aplicar_cambios and asignaciones:
-        resultado["aplicacion_cambios"] = aplicar_asignaciones_api(asignaciones, client, api_base_url)
-    else:
-        resultado["aplicacion_cambios"] = {"aplicado": False}
+    # Hora de asignacion: el instante (UTC) en que se entrega el resultado
+    resultado["timestamp_asignacion_utc"] = ahora_utc_iso() if asignaciones else None
     return resultado
 
 
@@ -1134,7 +1098,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimizador de Rutas VRP")
     parser.add_argument("--fecha", help="Fecha a optimizar (YYYY-MM-DD). Por defecto se infiere de las OTs.")
     parser.add_argument("--reset", action="store_true", help="Llama a /api/reset de la API externa antes de optimizar")
-    parser.add_argument("--aplicar", action="store_true", help="Aplica las asignaciones en la API externa")
     args = parser.parse_args()
 
     print("OPTIMIZADOR DE RUTAS VRP")
@@ -1145,7 +1108,7 @@ if __name__ == "__main__":
                 print(f"-> /api/reset: HTTP {r.status_code}")
             except requests.RequestException as e:
                 print(f"-> /api/reset fallo: {e}")
-        res = optimizar_jornada(fecha=args.fecha, aplicar_cambios=args.aplicar, session=s)
+        res = optimizar_jornada(fecha=args.fecha, session=s)
 
     print("\n=== RESULTADO ===")
     print(json.dumps(res["resumen"], indent=2, ensure_ascii=False))
