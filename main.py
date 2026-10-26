@@ -222,6 +222,8 @@ def obtener_disponibilidad_fuente(fecha: Optional[str] = None) -> list:
 
 class AsignarTecnicoRequest(BaseModel):
     tecnico_id: str
+    timestamp_asignacion_utc: Optional[str] = Field(
+        default=None, description="Hora de asignacion en UTC (ISO 8601). Si se omite, se usa el instante del request.")
 
 
 class AsignacionItem(BaseModel):
@@ -449,9 +451,10 @@ def asignaciones_masivas(body: AsignacionesMasivasRequest):
 
 @app.patch("/api/ordenes/{id}/tecnico", tags=["Ordenes de Trabajo"], summary="Asignacion individual")
 def asignar_tecnico(id: str, body: AsignarTecnicoRequest):
+    timestamp = body.timestamp_asignacion_utc or optimizador.ahora_utc_iso()
     try:
         res = requests.patch(f"{EXTERNAL_API_BASE}/ordenes/{id}/tecnico",
-                             json={"tecnico_id": body.tecnico_id}, timeout=15)
+                             json={"tecnico_id": body.tecnico_id, "timestamp_asignacion_utc": timestamp}, timeout=15)
         if res.status_code == 200:
             return res.json()
         if res.status_code == 404:
@@ -463,6 +466,7 @@ def asignar_tecnico(id: str, body: AsignarTecnicoRequest):
     if not orden:
         raise HTTPException(status_code=404, detail=f"OT '{id}' no encontrada.")
     orden["tecnico_id"] = body.tecnico_id
+    orden["timestamp_asignacion_utc"] = timestamp
     return orden
 
 # =============================================================================

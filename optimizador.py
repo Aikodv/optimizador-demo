@@ -16,7 +16,7 @@ import copy
 import json
 import math
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -836,12 +836,18 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
 # =============================================================================
 # 5. RESULTADO Y APLICACION EN API
 # =============================================================================
+def ahora_utc_iso() -> str:
+    """Instante actual en UTC, ISO 8601 con sufijo Z (ej: 2026-10-01T14:03:27Z)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _resultado_vacio(status: str, mensaje: str, fecha: Optional[str], ordenes: List[Dict[str, Any]],
                      alertas: Optional[List[str]] = None, total_tecnicos: int = 0) -> Dict[str, Any]:
     return {
         "status": status,
         "mensaje": mensaje,
         "fecha": fecha,
+        "timestamp_asignacion_utc": None,
         "resumen": {
             "total_ots": len(ordenes),
             "ots_asignadas": 0,
@@ -1028,7 +1034,8 @@ def aplicar_asignaciones_api(asignaciones: List[Dict[str, Any]], client: Any, ap
             continue
         try:
             res = client.patch(f"{api_base_url}/ordenes/{a['ot_id']}/tecnico",
-                               json={"tecnico_id": a["tecnico_id"]}, timeout=15)
+                               json={"tecnico_id": a["tecnico_id"],
+                                     "timestamp_asignacion_utc": a["timestamp_asignacion_utc"]}, timeout=15)
             if res.status_code == 200:
                 out["enviadas"] += 1
             else:
@@ -1107,6 +1114,12 @@ def _optimizar(
     manager, routing, solution = resolver_rutas(data, cfg, tiempo_limite_segundos)
     resultado, asignaciones = construir_resultado(manager, routing, solution, tecnicos, ordenes, data, cfg, fecha_efectiva)
     resultado["_tiempo_limite_s"] = data["tiempo_limite_s"]
+
+    # Hora de asignacion: el instante (UTC) en que se entrega el resultado; el mismo valor va a la API externa
+    timestamp = ahora_utc_iso() if asignaciones else None
+    resultado["timestamp_asignacion_utc"] = timestamp
+    for a in asignaciones:
+        a["timestamp_asignacion_utc"] = timestamp
 
     if aplicar_cambios and asignaciones:
         resultado["aplicacion_cambios"] = aplicar_asignaciones_api(asignaciones, client, api_base_url)
