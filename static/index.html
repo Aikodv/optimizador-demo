@@ -836,6 +836,20 @@
       `;
     }
 
+    // Diferencia en minutos entre la hora estimada de inicio y la hora programada (null si la OT no tiene hora)
+    function desvioHoraMin(p) {
+      const aMin = h => { const m = /^(\d{1,2}):(\d{2})$/.exec(h || ''); return m ? (+m[1]) * 60 + (+m[2]) : null; };
+      const prog = aMin(p.hora_programada), est = aMin(p.hora_estimada_llegada);
+      return prog === null || est === null ? null : est - prog;
+    }
+
+    function textoDesvioHora(p) {
+      const desvio = desvioHoraMin(p);
+      if (desvio === null) return 'sin hora programada';
+      if (desvio === 0) return `programada ${p.hora_programada} · a la hora`;
+      return `programada ${p.hora_programada} · ${Math.abs(desvio)} min ${desvio < 0 ? 'antes' : 'después'}`;
+    }
+
     function renderizarHojasDeRuta() {
       const cont = document.getElementById('contenedor-rutas');
       if (!currentRutas.length) {
@@ -883,6 +897,7 @@
                   </div>
                   <div class="text-right flex-shrink-0 pl-2">
                     <div class="font-mono text-[10px] font-bold text-sky-400">${p.hora_estimada_llegada || '--'}</div>
+                    <div class="text-[9px] ${desvioHoraMin(p) ? 'text-amber-400' : 'text-slate-500'}">${escapeHtml(textoDesvioHora(p))}</div>
                     <div class="text-[9px] text-slate-500">${p.duracion_servicio_min || 30} min</div>
                   </div>
                 </div>
@@ -1052,6 +1067,7 @@
               <div><strong>Cliente:</strong> ${p.cliente || 'Particular'}</div>
               <div><strong>Dirección:</strong> ${p.direccion}</div>
               <div><strong>Horario Estimado:</strong> <span class="font-bold text-sky-800">${p.hora_estimada_llegada} - ${p.hora_estimada_salida}</span></div>
+              <div><strong>Hora Programada:</strong> <span class="${desvioHoraMin(p) ? 'font-bold text-amber-700' : ''}">${escapeHtml(textoDesvioHora(p).replace(/^programada /, ''))}</span></div>
               <div><strong>Tipo Servicio:</strong> ${p.tipo.replace('_', ' ')} (${p.duracion_servicio_min || 30} min)</div>
               <div><strong>Sector:</strong> ${p.sector || r.zona_base}</div>
             </div>
