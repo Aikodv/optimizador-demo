@@ -1121,8 +1121,8 @@ def construir_resultado(
                 "hora_estimada_salida": hora(inicio + st[node]),
                 "espera_min": espera,
                 "duracion_servicio_min": st[node],
-                # Km acumulados desde la salida del tecnico hasta esta OT, sin vuelta a la base (HU-29/HU-30)
-                "kilometraje_estimado": round(distancia_m / 1000.0, 1),
+                # Km del tramo hacia esta OT desde la base o la OT anterior, no acumulado (HU-29/HU-30)
+                "kilometraje_estimado": round(tramo_m / 1000.0, 1),
                 "sector": data["orden_sectores_nombre"][i],
             }
             paradas.append(parada)
