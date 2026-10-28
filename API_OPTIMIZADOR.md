@@ -86,7 +86,7 @@ Lo normal es enviar `{}` o solo `fecha`. Si el request incluye `aplicar_cambios`
 | `timestamp_asignacion_utc` | Instante en que se generó la propuesta. |
 | `resumen` | `total_ots`, `ots_asignadas`, `ots_pendientes`, `pendientes_por_causa`, `total_tecnicos`, `tecnicos_utilizados`, `distancia_total_km`, `costo_objetivo`, `fuente_matriz` y `precision_ubicaciones`. |
 | `rutas[]` | Una por técnico: `tecnico_id`, `nombre`, `tipo`, `zona_base`, coordenadas de la base, `capacidad_uso`, `hora_salida_base`, `hora_fin_ruta`, `duracion_total_min`, `distancia_total_km`, `tiempo_espera_total_min`, `total_ots` y `paradas[]`. |
-| `rutas[].paradas[]` | `secuencia`, `ot_id`, `tipo`, `cliente`, `direccion`, coordenadas, `precision_ubicacion`, `hora_programada`, `hora_estimada_llegada`, `hora_estimada_salida`, `espera_min`, `duracion_servicio_min`, `kilometraje_estimado` y `sector`. |
+| `rutas[].paradas[]` | `secuencia`, `ot_id`, `tipo`, `cliente`, `direccion`, coordenadas, `precision_ubicacion`, `hora_programada`, `hora_estimada_llegada`, `hora_estimada_salida`, `espera_min`, `duracion_servicio_min`, `kilometraje_estimado` (km acumulados desde la salida del técnico hasta esa OT, sin vuelta a la base) y `sector`. |
 | `diagnosticos[]` | OTs sin asignar: datos de la OT, `causa_principal`, `causas` (`codigo`, `categoria`, `detalle`) y `razones` (texto con prefijo, por ejemplo `"TIEMPO: ..."`). |
 | `alertas[]` | Avisos: OTs fuera del radio operacional, distancias estimadas en vez de viales, sectores reservados sin interno, etc. |
 | `parametros_corrida` | Fecha, tiempo límite usado y la configuración con la que se resolvió. |

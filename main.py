@@ -306,7 +306,8 @@ def ejecutar_optimizador_endpoint(body: EjecutarOptimizacionRequest):
     - `tiempo_limite_segundos` omitido: se calcula con la configuracion.
 
     Las rutas son abiertas: terminan en la ultima OT (`hora_fin_ruta`), sin volver a la base, y
-    `distancia_total_km` no incluye regreso. Cada parada trae su `kilometraje_estimado`.
+    `distancia_total_km` no incluye regreso. Cada parada trae su `kilometraje_estimado`
+    (km acumulados desde la salida del tecnico hasta esa OT).
 
     Cada OT sin asignar viene en `diagnosticos` con su causa clasificada (`causa_principal` y `causas`).
     Una OT sin ubicacion nunca se rutea: queda en `diagnosticos` con causa `georreferencia`.
