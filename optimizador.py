@@ -18,8 +18,10 @@ import copy
 import json
 import math
 import os
+import re
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -37,14 +39,27 @@ from geocoding import (
 # =============================================================================
 # CONFIGURACION
 # =============================================================================
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://api-dummy-yurf.onrender.com/api").rstrip("/")
+API_BASE_URL = os.environ.get("API_BASE_URL", "https://goodroute-backend.onrender.com/api").rstrip("/")
+API_TIMEOUT_S = 60  # El backend en Render tarda hasta ~50 s en despertar
+ZONA_HORARIA_CHILE = ZoneInfo("America/Santiago")
 OSRM_TABLE_URL = os.environ.get("OSRM_TABLE_URL", "https://router.project-osrm.org/table/v1/driving")
 
 def _p(clave: str, default: Any, tipo: str, grupo: str, ambito: str, origen: str, etiqueta: str,
        descripcion: str, unidad: Optional[str] = None, minimo: Optional[float] = None,
-       maximo: Optional[float] = None) -> Dict[str, Any]:
-    return {"clave": clave, "etiqueta": etiqueta, "descripcion": descripcion, "tipo": tipo, "unidad": unidad,
-            "minimo": minimo, "maximo": maximo, "default": default, "grupo": grupo, "ambito": ambito, "origen": origen}
+       maximo: Optional[float] = None, fuente: Optional[str] = None,
+       origen_por_clave: Optional[Dict[str, Dict[str, str]]] = None) -> Dict[str, Any]:
+    p = {"clave": clave, "etiqueta": etiqueta, "descripcion": descripcion, "tipo": tipo, "unidad": unidad,
+         "minimo": minimo, "maximo": maximo, "default": default, "grupo": grupo, "ambito": ambito, "origen": origen,
+         "fuente": fuente}
+    if origen_por_clave:  # Parametros dict cuyos valores tienen origenes distintos
+        p["origen_por_clave"] = origen_por_clave
+    return p
+
+
+# Fuente de los valores vigentes: configuracion enviada a la dispatcher el 25-10-2026 y sus respuestas del 26-10-2026
+_DISPATCHER = "Dispatcher (respuestas del 26-10-2026)"
+_ENVIADA = ("Configuracion enviada a la dispatcher el 25-10-2026; ella no entrego un valor exacto para este "
+            "tipo")
 
 
 AMBITOS = {
@@ -63,27 +78,50 @@ ORIGENES = {
 PARAMETROS: List[Dict[str, Any]] = [
     # --- Tiempos de servicio ---
     _p("tiempos_servicio_por_tipo",
-       {"instalacion_simple": 45, "instalacion_con_corte": 90, "mantencion": 40, "retiro": 25},
+       {"instalacion_simple": 40, "instalacion_con_corte": 40, "mantencion": 30, "retiro": 30},
        "dict_int", "tiempos_servicio", "negocio", "operacion_cliente", "Duracion del servicio por tipo de OT",
-       "Minutos que el tecnico permanece en el domicilio segun el tipo de OT.", "min", 1, 600),
-    _p("tiempo_servicio_default", 30, "int", "tiempos_servicio", "negocio", "supuesto_equipo",
+       "Minutos que el tecnico permanece en el domicilio segun el tipo de OT. Las claves son los tipos del "
+       "modelo 3.0 en snake_case (instalacionSimple -> instalacion_simple).", "min", 1, 600,
+       fuente="Ver origen_por_clave",
+       origen_por_clave={
+           "instalacion_simple": {"origen": "operacion_cliente", "fuente": _DISPATCHER},
+           "instalacion_con_corte": {"origen": "operacion_cliente",
+                                     "fuente": f"{_DISPATCHER}, sujeto a validacion segun la complejidad"},
+           "mantencion": {"origen": "supuesto_equipo",
+                          "fuente": f"{_ENVIADA}. Da 30 a 40 min para 'servicio tecnico', que en su lista ocupa el "
+                                    f"lugar de mantencion"},
+           "retiro": {"origen": "operacion_cliente", "fuente": _DISPATCHER},
+       }),
+    _p("tiempo_servicio_default", 40, "int", "tiempos_servicio", "negocio", "supuesto_equipo",
        "Duracion para tipos de OT no listados", "Minutos de servicio cuando el tipo de OT no tiene duracion definida.",
-       "min", 1, 600),
+       "min", 1, 600, fuente=f"{_ENVIADA}. Propone 40 a 60 min para 'otros servicios'"),
 
-    # --- Jornada ---
+    # --- Jornada (horas de Chile) ---
     _p("inicio_jornada_horas", 8, "int", "jornada", "negocio", "operacion_cliente", "Inicio de jornada",
-       "Hora del dia en que los tecnicos salen de su base (minuto 0 del modelo).", "hora del dia", 5, 12),
-    _p("fin_jornada_horas", 18, "int", "jornada", "negocio", "operacion_cliente", "Fin de jornada",
-       "Hora del dia en que el tecnico debe estar de vuelta en su base. Debe ser posterior al inicio de jornada.",
-       "hora del dia", 6, 23),
-    _p("ventana_tolerancia_min", 30, "int", "jornada", "negocio", "supuesto_equipo", "Tolerancia de la hora acordada",
-       "Minutos antes/despues de la hora programada en que se permite iniciar el servicio.", "min", 0, 240),
+       "Hora de Chile en que los tecnicos inician la jornada (minuto 0 del modelo).", "hora del dia", 5, 12,
+       fuente=_DISPATCHER),
+    _p("fin_jornada_horas", 19, "int", "jornada", "negocio", "operacion_cliente", "Fin de jornada",
+       "Hora de Chile en que debe terminar el ultimo servicio del tecnico (la ruta termina en su ultima OT, sin "
+       "volver a la base). Debe ser posterior al inicio de jornada.", "hora del dia", 6, 23,
+       fuente=f"{_DISPATCHER}, como rango inicial de planificacion"),
+    _p("tolerancia_antes_min", 30, "int", "jornada", "negocio", "operacion_cliente",
+       "Tolerancia antes de la hora acordada",
+       "Minutos antes de la hora programada en que se permite iniciar el servicio.", "min", 0, 240,
+       fuente=f"{_DISPATCHER}, como propuesta inicial"),
+    _p("tolerancia_despues_min", 15, "int", "jornada", "negocio", "operacion_cliente",
+       "Tolerancia despues de la hora acordada",
+       "Minutos despues de la hora programada en que todavia se permite iniciar el servicio.", "min", 0, 240,
+       fuente=f"{_DISPATCHER}, como propuesta inicial"),
 
     # --- Capacidad ---
-    _p("capacidad_max_externo", 8, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico externo",
-       "Tope de OTs diarias de un externo; el cap_max individual del tecnico solo puede reducirlo.", "OTs", 1, 30),
-    _p("capacidad_max_interno", 12, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico interno",
-       "Tope de OTs diarias de un interno; el cap_max individual del tecnico solo puede reducirlo.", "OTs", 1, 30),
+    _p("capacidad_max_externo", 10, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico externo",
+       "Tope de OTs diarias de un externo; el cap_max individual del tecnico solo puede reducirlo. La capacidad "
+       "real la dan la jornada y los tiempos de servicio y traslado.", "OTs", 1, 30,
+       fuente=f"{_DISPATCHER}, como tope tecnico inicial y ajustable"),
+    _p("capacidad_max_interno", 20, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico interno",
+       "Tope de OTs diarias de un interno; el cap_max individual del tecnico solo puede reducirlo. La capacidad "
+       "real la dan la jornada y los tiempos de servicio y traslado.", "OTs", 1, 30,
+       fuente=f"{_DISPATCHER}, como tope tecnico inicial y ajustable"),
 
     # --- Sectores ---
     _p("umbral_ots_sector_interno", 10, "int", "sectores", "negocio", "operacion_cliente",
@@ -209,6 +247,8 @@ def restaurar_configuracion() -> Dict[str, Any]:
 # =============================================================================
 # Causas por las que una OT queda sin asignar: codigo -> (categoria, prefijo del texto, descripcion).
 CAUSAS: Dict[str, Tuple[str, str, str]] = {
+    "DATOS_INVALIDOS": ("datos", "DATOS",
+                        "La fecha u hora programada de la OT no tiene un formato reconocible; no se supone una."),
     "SIN_GEORREFERENCIA": ("georreferencia", "GEORREFERENCIA",
                            "La OT no tiene coordenadas y su direccion no se pudo ubicar en el mapa (no se usa el "
                            "centro de la comuna ni otra ubicacion supuesta)."),
@@ -218,7 +258,8 @@ CAUSAS: Dict[str, Tuple[str, str, str]] = {
     "DURACION_EXCEDE_JORNADA": ("temporal", "DURACION", "El servicio dura mas que la jornada completa."),
     "HORA_FUERA_DE_JORNADA": ("temporal", "HORARIO", "La hora programada queda fuera de la jornada."),
     "VENTANA_INALCANZABLE": ("temporal", "TIEMPO",
-                             "Ningun tecnico alcanza a llegar dentro de la ventana horaria y volver a su base."),
+                             "Ningun tecnico alcanza a llegar dentro de la ventana horaria y terminar el servicio "
+                             "antes del fin de jornada."),
     "CAPACIDAD_AGOTADA": ("capacidad", "CAPACIDAD", "Los tecnicos que podian atenderla completaron su maximo de OTs."),
     "SIN_CUPO_EN_RUTAS": ("optimizacion", "OPTIMIZACION",
                           "Individualmente era atendible, pero no cabe en la jornada junto a las demas OTs asignadas."),
@@ -237,8 +278,12 @@ def _razon(causa: Dict[str, str]) -> str:
 def describir_modelo() -> Dict[str, Any]:
     """Declaracion del modelo tal como lo construyen construir_modelo() y calcular_matrices_costo()."""
     return {
-        "tipo": "VRP con ventanas horarias, capacidad, multiples depositos y visitas opcionales (Google OR-Tools Routing)",
-        "nodos": "Una base por tecnico (inicio y fin de su ruta) y un nodo por OT.",
+        "tipo": "VRP abierto con ventanas horarias, capacidad, multiples depositos y visitas opcionales "
+                "(Google OR-Tools Routing)",
+        "nodos": "Una base por tecnico (inicio de su ruta), un nodo por OT y un nodo de termino ficticio, comun a "
+                 "todos, con distancia y tiempo cero desde cualquier nodo: la ruta termina en la ultima OT.",
+        "zona_horaria": "Las horas de la jornada, de las ventanas y del resultado son hora de Chile "
+                        "(America/Santiago). horaProgramada llega en UTC desde el backend y se convierte.",
         "variables": [
             {"nombre": "next[i]", "descripcion": "Nodo que se visita despues del nodo i (define la secuencia de cada ruta)."},
             {"nombre": "vehiculo[i]", "descripcion": "Tecnico que atiende la OT i."},
@@ -250,7 +295,8 @@ def describir_modelo() -> Dict[str, Any]:
             "sentido": "minimizar",
             "unidad": "metros (las penalizaciones se expresan en metros equivalentes)",
             "terminos": [
-                {"termino": "Distancia vial recorrida por todos los tecnicos", "parametros": []},
+                {"termino": "Distancia vial recorrida por todos los tecnicos hacia cada OT (sin regreso a la base)",
+                 "parametros": []},
                 {"termino": "penalty_drop_node por cada OT sin asignar", "parametros": ["penalty_drop_node"]},
                 {"termino": "penalty_mix_sector por cada cambio de sector en la ruta de un interno",
                  "parametros": ["penalty_mix_sector"]},
@@ -259,22 +305,25 @@ def describir_modelo() -> Dict[str, Any]:
                 {"termino": "costo_por_ot_externo por cada OT atendida por un externo", "parametros": ["costo_por_ot_externo"]},
                 {"termino": "span_cost_coefficient x duracion de la ruta mas larga (balance de carga)",
                  "parametros": ["span_cost_coefficient"]},
-                {"termino": "1 por cada minuto de la hora de retorno a la base (rutas compactas, sin esperas)",
-                 "parametros": []},
+                {"termino": "1 por cada minuto de la hora de termino del ultimo servicio (rutas compactas, sin "
+                            "esperas)", "parametros": []},
             ],
         },
         "restricciones_implementadas": [
             {"codigo": "R1", "nombre": "Asignacion unica", "tipo": "dura",
              "descripcion": "Cada OT se visita a lo mas una vez y por un solo tecnico."},
-            {"codigo": "R2", "nombre": "Base del tecnico", "tipo": "dura",
-             "descripcion": "Cada ruta parte y termina en la base del tecnico."},
+            {"codigo": "R2", "nombre": "Ruta abierta", "tipo": "dura",
+             "descripcion": "Cada ruta parte en la base del tecnico y termina en su ultima OT: el tecnico no vuelve "
+                            "a la base."},
             {"codigo": "R3", "nombre": "Jornada", "tipo": "dura",
-             "descripcion": "Toda la ruta (viajes, esperas y servicios) ocurre dentro de la jornada.",
+             "descripcion": "Viajes, esperas y servicios ocurren dentro de la jornada: el ultimo servicio termina "
+                            "a mas tardar al fin de jornada.",
              "parametros": ["inicio_jornada_horas", "fin_jornada_horas"]},
             {"codigo": "R4", "nombre": "Ventana horaria", "tipo": "dura",
-             "descripcion": "Una OT con hora programada inicia dentro de hora +/- tolerancia; el servicio debe "
-                            "terminar antes del fin de jornada.",
-             "parametros": ["ventana_tolerancia_min", "tiempos_servicio_por_tipo", "tiempo_servicio_default"]},
+             "descripcion": "Una OT con hora programada inicia entre hora - tolerancia antes y hora + tolerancia "
+                            "despues; el servicio debe terminar antes del fin de jornada.",
+             "parametros": ["tolerancia_antes_min", "tolerancia_despues_min", "tiempos_servicio_por_tipo",
+                            "tiempo_servicio_default"]},
             {"codigo": "R5", "nombre": "Capacidad", "tipo": "dura",
              "descripcion": "Cada tecnico atiende como maximo su capacidad de OTs.",
              "parametros": ["capacidad_max_interno", "capacidad_max_externo"]},
@@ -289,6 +338,9 @@ def describir_modelo() -> Dict[str, Any]:
              "descripcion": "Una OT puede quedar sin asignar pagando una penalizacion alta; asi el modelo siempre "
                             "tiene solucion y reporta las OTs pendientes con su causa.",
              "parametros": ["penalty_drop_node"]},
+            {"codigo": "R10", "nombre": "Datos validos", "tipo": "dura",
+             "descripcion": "Una OT cuya fecha u hora programada no tiene formato reconocible no se rutea: queda "
+                            "pendiente con causa DATOS_INVALIDOS."},
         ],
         "restricciones_fuera_de_esta_version": [
             "Habilidades o certificaciones del tecnico segun el tipo de OT.",
@@ -326,7 +378,7 @@ def minutos_desde_inicio(hora_str: Optional[str], inicio_horas: int) -> Optional
 
 def duracion_jornada_min(cfg: Dict[str, Any]) -> int:
     """Minutos entre el inicio y el fin de jornada: el minuto en que el modelo cierra la jornada."""
-    return (int(cfg.get("fin_jornada_horas", 18)) - int(cfg.get("inicio_jornada_horas", 8))) * 60
+    return (int(cfg.get("fin_jornada_horas", 19)) - int(cfg.get("inicio_jornada_horas", 8))) * 60
 
 
 def minutos_a_hora_str(minutos: int, inicio_horas: int) -> str:
@@ -343,7 +395,7 @@ def resolver_base_tecnico(tecnico: Dict[str, Any]) -> Tuple[Tuple[float, float],
     for k_lat, k_lon in (("base_latitud", "base_longitud"), ("latitud", "longitud")):
         if coordenada_valida(tecnico.get(k_lat), tecnico.get(k_lon)):
             return (float(tecnico[k_lat]), float(tecnico[k_lon])), "original"
-    comuna = extraer_comuna(tecnico.get("zona") or "")
+    comuna = extraer_comuna(tecnico.get("zona") or "") or extraer_comuna(tecnico.get("comuna") or "")
     if comuna:
         return cargar_coordenadas_comunas()[comuna][:2], "comuna"
     return COORD_DEFAULT, "aproximada"
@@ -493,52 +545,144 @@ def alertas_radio_operacional(
     return alertas
 
 # =============================================================================
-# 1. EXTRACCION (API) - SOLO LECTURA
+# 1. EXTRACCION (backend del modelo 3.0) - SOLO LECTURA
 # =============================================================================
+# El backend entrega camelCase (claves y valores de tipo/estado) y horaProgramada en UTC.
+# Internamente el optimizador trabaja en snake_case y en hora de Chile: la conversion ocurre
+# solo aqui, al leer, para que el resto del pipeline (y el dashboard) no dependa del formato externo.
+
+def a_snake(texto: str) -> str:
+    """'instalacionConCorte' -> 'instalacion_con_corte' (deja igual lo que ya es snake_case)."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", texto).lower()
+
+
+def a_camel(texto: str) -> str:
+    """'por_asignar' -> 'porAsignar' (deja igual lo que ya es camelCase)."""
+    primera, *resto = texto.split("_")
+    return primera + "".join(p.capitalize() for p in resto)
+
+
+def hoy_chile() -> str:
+    """Fecha de hoy en Chile (el servidor corre en UTC: de noche ya es "manana" en UTC)."""
+    return datetime.now(ZONA_HORARIA_CHILE).date().isoformat()
+
+
+def parsear_fecha(texto: Any) -> Optional[date]:
+    """
+    fechaProgramada es texto libre en el sistema externo. Se aceptan YYYY-MM-DD (con o sin hora ISO a
+    continuacion), YYYY/MM/DD y DD-MM-YYYY o DD/MM/YYYY (orden chileno). Otra forma -> None.
+    """
+    s = str(texto).strip()
+    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T ].*)?$", s)
+    if m:
+        y, mes, d = m.groups()
+    else:
+        m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$", s)
+        if not m:
+            return None
+        d, mes, y = m.groups()
+    try:
+        return date(int(y), int(mes), int(d))
+    except ValueError:
+        return None
+
+
+def parsear_hora(texto: Any) -> Optional[Tuple[int, int]]:
+    """'HH:MM' o 'HH:MM:SS' -> (h, m). Otra forma -> None."""
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", str(texto).strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def normalizar_tecnico(t: Dict[str, Any]) -> Dict[str, Any]:
+    """Tecnico del modelo 3.0 -> formato interno (claves snake_case)."""
+    return {a_snake(k): v for k, v in t.items()}
+
+
+def normalizar_orden(o: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    OT del modelo 3.0 -> formato interno. horaProgramada (UTC, como la guarda ControlTraza) se
+    convierte a hora de Chile considerando el horario de verano: fechaProgramada + horaProgramada
+    se interpretan como un instante UTC, y fecha y hora internas son las de ese instante en Chile.
+    Una fecha u hora con forma no reconocible deja la OT marcada en `dato_invalido` (no se supone otra).
+    """
+    ot = {a_snake(k): v for k, v in o.items()}
+    for campo in ("tipo", "estado"):
+        if isinstance(ot.get(campo), str):
+            ot[campo] = a_snake(ot[campo])
+    ot.setdefault("cliente", ot.get("contacto_nombre"))
+
+    fecha_txt, hora_txt = o.get("fechaProgramada"), o.get("horaProgramada")
+    ot["fecha_programada_origen"], ot["hora_programada_utc"] = fecha_txt, hora_txt
+    ot["fecha_programada"], ot["hora_programada"] = None, None
+    fecha = parsear_fecha(fecha_txt) if fecha_txt not in (None, "") else None
+    if fecha_txt not in (None, "") and fecha is None:
+        ot["dato_invalido"] = f"fechaProgramada '{fecha_txt}' no tiene un formato de fecha reconocible (YYYY-MM-DD)."
+        return ot
+    if hora_txt in (None, ""):
+        ot["fecha_programada"] = fecha.isoformat() if fecha else None
+        return ot
+    hora = parsear_hora(hora_txt)
+    if hora is None:
+        ot["fecha_programada"] = fecha.isoformat() if fecha else None
+        ot["dato_invalido"] = f"horaProgramada '{hora_txt}' no tiene formato HH:MM."
+        return ot
+    # Sin fecha, el desfase UTC/Chile se toma el de hoy
+    base = fecha or date.fromisoformat(hoy_chile())
+    local = datetime(base.year, base.month, base.day, *hora, tzinfo=timezone.utc).astimezone(ZONA_HORARIA_CHILE)
+    ot["fecha_programada"] = local.date().isoformat() if fecha else None
+    ot["hora_programada"] = local.strftime("%H:%M")
+    return ot
+
+
+def tecnico_disponible(tecnico: Dict[str, Any], fecha: str) -> bool:
+    """disponibilidad: boolean[7] de lunes (0) a domingo (6); `fecha` es una fecha de Chile."""
+    disp = tecnico.get("disponibilidad")
+    if tecnico.get("activo") is False or not isinstance(disp, list) or len(disp) != 7:
+        return False
+    return bool(disp[date.fromisoformat(fecha).weekday()])
+
+
 def _get_json(client: Any, url: str, params: Optional[Dict[str, str]] = None) -> Any:
-    res = client.get(url, params=params, timeout=25)
+    res = client.get(url, params=params, timeout=API_TIMEOUT_S)
     res.raise_for_status()
     return res.json()
 
 
+def obtener_tecnicos(client: Any, api_base_url: str) -> List[Dict[str, Any]]:
+    return [normalizar_tecnico(t) for t in _get_json(client, f"{api_base_url}/v1/tecnicos")]
+
+
+def obtener_ordenes(client: Any, api_base_url: str, estado: Optional[str] = None) -> List[Dict[str, Any]]:
+    params = {"estado": a_camel(estado)} if estado else None
+    return [normalizar_orden(o) for o in _get_json(client, f"{api_base_url}/v1/ordenes", params)]
+
+
+def filtrar_por_fecha(ordenes: List[Dict[str, Any]], fecha: str) -> List[Dict[str, Any]]:
+    """OTs de la fecha (en Chile), sin fecha programada, o con fecha invalida (para reportarlas con su causa)."""
+    return [o for o in ordenes if o.get("dato_invalido") or not o.get("fecha_programada")
+            or o["fecha_programada"] == fecha]
+
+
 def obtener_ordenes_pendientes(client: Any, api_base_url: str, fecha: Optional[str]) -> List[Dict[str, Any]]:
-    """OTs 'por_asignar'. Con fecha, solo las programadas para ese dia (o sin fecha programada)."""
-    ordenes = _get_json(client, f"{api_base_url}/ordenes", {"estado": "por_asignar"})
-    if fecha:
-        ordenes = [o for o in ordenes if not o.get("fecha_programada") or o["fecha_programada"] == fecha]
-    return ordenes
+    """
+    OTs porAsignar. Se piden sin el filtro `fecha` del backend: la fecha se compara despues de pasar la
+    hora a Chile, y una OT con fecha mal formada debe llegar como pendiente con su causa, no desaparecer.
+    """
+    ordenes = obtener_ordenes(client, api_base_url, "porAsignar")
+    return filtrar_por_fecha(ordenes, fecha) if fecha else ordenes
 
 
 def inferir_fecha(ordenes: List[Dict[str, Any]]) -> str:
-    """Fecha programada mas temprana entre las OTs, o hoy."""
+    """Fecha programada mas temprana entre las OTs, o hoy (en Chile)."""
     fechas = sorted({o["fecha_programada"] for o in ordenes if o.get("fecha_programada")})
-    return fechas[0] if fechas else date.today().isoformat()
+    return fechas[0] if fechas else hoy_chile()
 
 
-def obtener_tecnicos_disponibles(
-    client: Any,
-    api_base_url: str,
-    fecha: str,
-    permitir_otra_fecha: bool,
-) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Tecnicos con disponibilidad para la fecha. Si no hay y se permite (fecha no indicada
-    explicitamente), usa la primera fecha con disponibilidad desde esa fecha en adelante.
-    """
-    tecnicos = _get_json(client, f"{api_base_url}/tecnicos")
-    disp = _get_json(client, f"{api_base_url}/disponibilidad", {"fecha": fecha})
-    ids = {d["tecnico_id"] for d in disp if d.get("disponible") and d.get("fecha", fecha) == fecha}
-
-    if not ids and permitir_otra_fecha:
-        todas = _get_json(client, f"{api_base_url}/disponibilidad")
-        fechas = sorted({d["fecha"] for d in todas if d.get("disponible") and d.get("fecha")})
-        candidatas = [f for f in fechas if f >= fecha] or fechas
-        if candidatas:
-            print(f"   [WARNING] Sin tecnicos disponibles el {fecha}; se usa {candidatas[0]}.")
-            fecha = candidatas[0]
-            ids = {d["tecnico_id"] for d in todas if d.get("disponible") and d.get("fecha") == fecha}
-
-    return [t for t in tecnicos if t.get("id") in ids], fecha
+def obtener_tecnicos_disponibles(client: Any, api_base_url: str, fecha: str) -> List[Dict[str, Any]]:
+    """Tecnicos activos con disponibilidad el dia de la semana de `fecha`."""
+    return [t for t in obtener_tecnicos(client, api_base_url) if tecnico_disponible(t, fecha)]
 
 # =============================================================================
 # 2. TRANSFORMACION (MODELO DE DATOS VRP)
@@ -549,7 +693,10 @@ def preparar_modelo_datos(
     cfg: Dict[str, Any],
     session: Optional[requests.Session] = None,
 ) -> Dict[str, Any]:
-    """Construye el modelo de datos para OR-Tools. Nodos: [bases de tecnicos..., OTs...]."""
+    """
+    Construye el modelo de datos para OR-Tools. Nodos: [bases de tecnicos..., OTs...]; el nodo de
+    termino de las rutas abiertas lo agrega construir_modelo().
+    """
     print("\n2. Transformando datos para el modelo VRP...")
     V = len(tecnicos)
     alertas: List[str] = []
@@ -567,7 +714,9 @@ def preparar_modelo_datos(
         ordenes, usar_geocoding=cfg.get("usar_geocoding", True),
         max_segundos=float(cfg.get("geocoding_max_segundos", 60)), session=session)
     no_ruteables: Dict[int, Dict[str, str]] = {   # OTs que se excluyen del modelo, con su causa
-        i: _causa("SIN_GEORREFERENCIA", detalle_sin_ubicacion(ordenes[i], motivo, cfg)) for i, motivo in motivos.items()}
+        i: _causa("DATOS_INVALIDOS", ot["dato_invalido"]) for i, ot in enumerate(ordenes) if ot.get("dato_invalido")}
+    for i, motivo in motivos.items():
+        no_ruteables.setdefault(i, _causa("SIN_GEORREFERENCIA", detalle_sin_ubicacion(ordenes[i], motivo, cfg)))
     sin_tiempo = sum(1 for m in motivos.values() if m == "sin_tiempo")
     if sin_tiempo:
         alertas.append(f"{sin_tiempo} direcciones nuevas no alcanzaron a geocodificarse (limite de "
@@ -624,7 +773,8 @@ def preparar_modelo_datos(
     # Ventanas horarias (y OTs imposibles de rutear, que se excluyen del modelo)
     fin_jornada = duracion_jornada_min(cfg)
     inicio_h = int(cfg.get("inicio_jornada_horas", 8))
-    tolerancia = int(cfg.get("ventana_tolerancia_min", 30))
+    tolerancia_antes = int(cfg.get("tolerancia_antes_min", 30))
+    tolerancia_despues = int(cfg.get("tolerancia_despues_min", 15))
     time_windows: List[Tuple[int, int]] = [(0, fin_jornada)] * V
 
     for i, ot in enumerate(ordenes):
@@ -641,8 +791,8 @@ def preparar_modelo_datos(
             time_windows.append((0, ultima_hora_inicio))
             continue
 
-        inicio_v = max(0, prog - tolerancia)
-        fin_v = min(ultima_hora_inicio, prog + tolerancia)
+        inicio_v = max(0, prog - tolerancia_antes)
+        fin_v = min(ultima_hora_inicio, prog + tolerancia_despues)
         if fin_v < inicio_v:
             no_ruteables.setdefault(i, _causa(
                 "HORA_FUERA_DE_JORNADA",
@@ -656,7 +806,6 @@ def preparar_modelo_datos(
     return {
         "num_vehicles": V,
         "starts": list(range(V)),
-        "ends": list(range(V)),
         "coords_bases": coords_bases,
         "distance_matrix": dist,
         "time_matrix": tiempo,
@@ -713,15 +862,24 @@ def calcular_matrices_costo(data: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[s
 
 
 def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[str, List[List[int]]]):
-    """Crea el modelo de ruteo: costos por tipo, tiempo con ventanas, capacidad y descarte penalizado."""
+    """
+    Crea el modelo de ruteo: costos por tipo, tiempo con ventanas, capacidad y descarte penalizado.
+    Rutas abiertas: todas terminan en un nodo ficticio (indice n) al que se llega con distancia y
+    tiempo cero desde cualquier nodo, asi la ruta acaba en la ultima OT y no se cobra el regreso.
+    """
     V = data["num_vehicles"]
     n = len(data["distance_matrix"])
-    manager = pywrapcp.RoutingIndexManager(n, V, data["starts"], data["ends"])
+    termino = n
+    manager = pywrapcp.RoutingIndexManager(n + 1, V, data["starts"], [termino] * V)
     routing = pywrapcp.RoutingModel(manager)
 
     penalty_drop = int(cfg.get("penalty_drop_node", 10_000_000))
     span_coeff = int(cfg.get("span_cost_coefficient", 50))
     fin_jornada = duracion_jornada_min(cfg)
+
+    def con_termino(matriz: List[List[int]], hacia_termino: List[int]) -> List[List[int]]:
+        # Del nodo de termino nunca se sale: su fila es irrelevante
+        return [fila + [hacia_termino[i]] for i, fila in enumerate(matriz)] + [[0] * (n + 1)]
 
     # Matrices registradas en C++ (RegisterTransitMatrix): el solver no llama a Python por cada arco,
     # lo que multiplica las iteraciones de busqueda en el mismo tiempo.
@@ -729,19 +887,21 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
     for v, tipo in enumerate(data["tipos_tecnico"]):
         clave = tipo if tipo in ("interno", "externo") else "base"
         if clave not in callbacks:
-            callbacks[clave] = routing.RegisterTransitMatrix(matrices[clave])
+            callbacks[clave] = routing.RegisterTransitMatrix(con_termino(matrices[clave], [0] * n))
         routing.SetArcCostEvaluatorOfVehicle(callbacks[clave], v)
 
-    # Dimension de tiempo: viaje + servicio en el nodo de origen
+    # Dimension de tiempo: viaje + servicio en el nodo de origen. Hacia el termino solo cuenta el
+    # servicio de la ultima OT: el fin de la ruta es la hora en que termina ese servicio.
     tiempo, st = data["time_matrix"], data["service_times"]
-    cb_tiempo = routing.RegisterTransitMatrix([[tiempo[i][j] + st[i] for j in range(n)] for i in range(n)])
+    cb_tiempo = routing.RegisterTransitMatrix(
+        con_termino([[tiempo[i][j] + st[i] for j in range(n)] for i in range(n)], st))
     routing.AddDimension(cb_tiempo, fin_jornada, fin_jornada, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
     if span_coeff > 0:
         time_dim.SetGlobalSpanCostCoefficient(span_coeff)
 
-    # Horarios concretos: costo minimo (1 por minuto) a la hora de termino para que las rutas
-    # terminen lo antes posible en vez de "flotar" hacia el final de la jornada. El span cost
+    # Horarios concretos: costo minimo (1 por minuto) a la hora de termino del ultimo servicio para
+    # que las rutas terminen lo antes posible en vez de "flotar" hacia el final de la jornada. El span cost
     # (fin - inicio) hace que, con ese termino, la salida sea lo mas tarde posible (sin esperas).
     for v in range(V):
         time_dim.SetCumulVarSoftUpperBound(routing.End(v), 0, 1)
@@ -761,7 +921,7 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
                 routing.VehicleVar(index).RemoveValue(v)
 
     # Capacidad (cantidad de OTs por tecnico)
-    cb_demanda = routing.RegisterUnaryTransitVector(data["demands"])
+    cb_demanda = routing.RegisterUnaryTransitVector(data["demands"] + [0])
     routing.AddDimensionWithVehicleCapacity(cb_demanda, 0, data["vehicle_capacities"], True, "Capacity")
     return manager, routing
 
@@ -834,10 +994,11 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
     st = data["service_times"][nodo]
     ini_v, fin_v = data["time_windows"][nodo]
 
-    # Factibilidad horaria: llegar dentro de la ventana y volver a la base antes del fin de jornada
+    # Factibilidad horaria: llegar dentro de la ventana y terminar el servicio antes del fin de jornada
+    # (la ruta es abierta: no hay regreso a la base)
     def factible(v: int) -> bool:
         llegada = tiempo[v][nodo]
-        return llegada <= fin_v and max(ini_v, llegada) + st + tiempo[nodo][v] <= fin_jornada
+        return llegada <= fin_v and max(ini_v, llegada) + st <= fin_jornada
 
     alcanzan = [v for v in range(V) if factible(v)]
     if not alcanzan:
@@ -846,7 +1007,7 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
             "VENTANA_INALCANZABLE",
             f"ningun tecnico alcanza a iniciar entre "
             f"{minutos_a_hora_str(ini_v, inicio_h)} y {minutos_a_hora_str(fin_v, inicio_h)} "
-            f"y volver antes del fin de jornada (viaje minimo desde base: {viaje_min} min, servicio: {st} min).")]
+            f"(viaje minimo desde base: {viaje_min} min, servicio: {st} min).")]
 
     con_cupo = [v for v in alcanzan if carga[v] < data["vehicle_capacities"][v]]
 
@@ -935,11 +1096,10 @@ def construir_resultado(
         paradas, distancia_m, espera_total = [], 0, 0
 
         index = solution.Value(routing.NextVar(index))
-        while True:
+        while not routing.IsEnd(index):  # El termino es ficticio: no suma distancia ni es parada
             node = manager.IndexToNode(index)
-            distancia_m += dist[prev_node][node]
-            if routing.IsEnd(index):
-                break
+            tramo_m = dist[prev_node][node]
+            distancia_m += tramo_m
             i = node - V
             ot = ordenes[i]
             inicio = solution.Min(time_dim.CumulVar(index))
@@ -961,6 +1121,8 @@ def construir_resultado(
                 "hora_estimada_salida": hora(inicio + st[node]),
                 "espera_min": espera,
                 "duracion_servicio_min": st[node],
+                # Distancia que el tecnico recorre hacia esta OT desde la base o la OT anterior (HU-29/HU-30)
+                "kilometraje_estimado": round(tramo_m / 1000.0, 1),
                 "sector": data["orden_sectores_nombre"][i],
             }
             paradas.append(parada)
@@ -968,12 +1130,12 @@ def construir_resultado(
                 "ot_id": ot["id"],
                 "tecnico_id": tec["id"],
                 **{k: parada[k] for k in ("secuencia", "hora_estimada_llegada", "hora_estimada_salida",
-                                          "duracion_servicio_min", "sector")},
+                                          "duracion_servicio_min", "kilometraje_estimado", "sector")},
             })
             prev_node, prev_inicio = node, inicio
             index = solution.Value(routing.NextVar(index))
 
-        t_retorno = solution.Min(time_dim.CumulVar(index))
+        t_fin = solution.Min(time_dim.CumulVar(index))  # Termino del ultimo servicio
         carga[v] = len(paradas)
         base_lat, base_lon = data["coords_bases"][v]
         nombre = f"{tec.get('nombre', '')} {tec.get('apellidos') or ''}".strip() or "Tecnico"
@@ -986,8 +1148,10 @@ def construir_resultado(
             "base_longitud": base_lon,
             "capacidad_uso": f"{len(paradas)}/{data['vehicle_capacities'][v]}",
             "hora_salida_base": hora(t_salida) if paradas else None,
-            "hora_retorno_base": hora(t_retorno) if paradas else None,
-            "duracion_total_min": (t_retorno - t_salida) if paradas else 0,
+            # Ruta abierta: el tecnico se queda en su ultima OT, no hay hora de retorno a la base
+            "hora_retorno_base": None,
+            "hora_fin_ruta": hora(t_fin) if paradas else None,
+            "duracion_total_min": (t_fin - t_salida) if paradas else 0,
             "distancia_total_km": round(distancia_m / 1000.0, 1),
             "tiempo_espera_total_min": espera_total,
             "total_ots": len(paradas),
@@ -1100,13 +1264,15 @@ def _optimizar(
     try:
         if ordenes is None:
             ordenes = obtener_ordenes_pendientes(client, api_base_url, fecha)
-        fecha_efectiva = fecha or inferir_fecha(ordenes)
+            fecha_efectiva = fecha or inferir_fecha(ordenes)
+            ordenes = filtrar_por_fecha(ordenes, fecha_efectiva)
+        else:
+            fecha_efectiva = fecha or inferir_fecha(ordenes)
         if tecnicos is None:
-            tecnicos, fecha_efectiva = obtener_tecnicos_disponibles(
-                client, api_base_url, fecha_efectiva, permitir_otra_fecha=not fecha)
+            tecnicos = obtener_tecnicos_disponibles(client, api_base_url, fecha_efectiva)
     except (requests.RequestException, ValueError) as e:
-        print(f"   [ERROR] API externa: {e}")
-        return _resultado_vacio("error_api", f"No se pudo consultar la API externa: {e}", fecha, ordenes or [])
+        print(f"   [ERROR] Backend: {e}")
+        return _resultado_vacio("error_api", f"No se pudo consultar el backend: {e}", fecha, ordenes or [])
 
     print(f"   [RESUMEN] {len(tecnicos)} tecnicos | {len(ordenes)} OTs (fecha: {fecha_efectiva})")
     if not tecnicos or not ordenes:
@@ -1132,14 +1298,14 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Optimizador de Rutas VRP")
     parser.add_argument("--fecha", help="Fecha a optimizar (YYYY-MM-DD). Por defecto se infiere de las OTs.")
-    parser.add_argument("--reset", action="store_true", help="Llama a /api/reset de la API externa antes de optimizar")
+    parser.add_argument("--reset", action="store_true", help="Llama a GET /api/reset del backend antes de optimizar")
     args = parser.parse_args()
 
     print("OPTIMIZADOR DE RUTAS VRP")
     with requests.Session() as s:
         if args.reset:
             try:
-                r = s.post(f"{API_BASE_URL}/reset", timeout=25)
+                r = s.get(f"{API_BASE_URL}/reset", timeout=API_TIMEOUT_S)
                 print(f"-> /api/reset: HTTP {r.status_code}")
             except requests.RequestException as e:
                 print(f"-> /api/reset fallo: {e}")
@@ -1149,7 +1315,7 @@ if __name__ == "__main__":
     print(json.dumps(res["resumen"], indent=2, ensure_ascii=False))
     for r in res["rutas"]:
         print(f"- {r['nombre']} ({r['tipo']}): {r['capacidad_uso']} OTs, {r['distancia_total_km']} km, "
-              f"{r['hora_salida_base'] or '--'} -> {r['hora_retorno_base'] or '--'}")
+              f"{r['hora_salida_base'] or '--'} -> {r['hora_fin_ruta'] or '--'}")
     for d in res["diagnosticos"]:
         print(f"! {d['ot_id']}: {' | '.join(d['razones'])}")
     for a in res["alertas"]:

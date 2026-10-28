@@ -1,5 +1,26 @@
 {
  "entradas": {
+  "agustinas 794|santiago": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.441167,
+   "lon": -70.6475666,
+   "precision": "numero"
+  },
+  "angel gaete 365|pichilemu": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -34.3872176,
+   "lon": -72.0044815,
+   "precision": "numero"
+  },
+  "arlegui 615|vina del mar": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.0234875,
+   "lon": -71.5534911,
+   "precision": "numero"
+  },
   "augusto carozzi 841|quilpue": {
    "fecha": "2026-09-29",
    "fuente": "nominatim",
@@ -32,6 +53,13 @@
    "lon": -71.4408527,
    "precision": "numero"
   },
+  "avenida libertad 1348|vina del mar": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.0088361,
+   "lon": -71.5472973,
+   "precision": "numero"
+  },
   "avenida libertador bernardo o'higgins 201|rancagua": {
    "fecha": "2026-09-29",
    "fuente": "nominatim",
@@ -44,6 +72,27 @@
    "fuente": "nominatim",
    "lat": -34.1549146,
    "lon": -70.7665854,
+   "precision": "numero"
+  },
+  "avenida libertador bernardo o'higgins 3363|estacion central": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.4507378,
+   "lon": -70.6800701,
+   "precision": "numero"
+  },
+  "avenida libertador bernardo o'higgins 3750|estacion central": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.4538591,
+   "lon": -70.6864494,
+   "precision": "numero"
+  },
+  "avenida libertador bernardo o'higgins 611|rancagua": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -34.1642127,
+   "lon": -70.7416026,
    "precision": "numero"
   },
   "avenida libertador bernardo o'higgins 651|santiago": {
@@ -67,6 +116,13 @@
    "lon": -71.6099947,
    "precision": "calle"
   },
+  "avenida santa maria 0500|providencia": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -33.4314504,
+   "lon": -70.6264679,
+   "precision": "calle"
+  },
   "avenida santos dumont 999|independencia": {
    "fecha": "2026-09-29",
    "fuente": "photon",
@@ -79,6 +135,13 @@
    "fuente": "photon",
    "lat": -33.5175543,
    "lon": -70.5983734,
+   "precision": "numero"
+  },
+  "carampangue 865|san fernando": {
+   "fecha": "2026-10-27",
+   "fuente": "nominatim",
+   "lat": -34.5833458,
+   "lon": -70.9903059,
    "precision": "numero"
   },
   "carelmapu 2|san fernando": {

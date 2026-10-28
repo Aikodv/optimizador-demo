@@ -314,6 +314,22 @@
             </div>
 
             <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Tolerancia antes de la hora</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-tolerancia-antes" min="0" max="240" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
+              <label class="text-[10px] text-slate-400 font-semibold">Tolerancia después de la hora</label>
+              <div class="flex items-center gap-1.5">
+                <input type="number" id="cfg-tolerancia-despues" min="0" max="240" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
+                <span class="text-[10px] text-slate-500">min</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-950 p-3 rounded-xl border border-slate-800 space-y-1">
               <label class="text-[10px] text-slate-400 font-semibold">Cap. Máx Internos</label>
               <div class="flex items-center gap-1.5">
                 <input type="number" id="cfg-cap-interno" min="1" max="25" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white font-bold focus:border-sky-500 focus:outline-none">
@@ -421,24 +437,13 @@
 
       <div class="space-y-4 text-xs">
         <div>
-          <label class="block font-semibold text-slate-300 mb-1.5 flex justify-between">
-            <span>Cantidad de Técnicos:</span>
-            <span id="label-num-tecnicos" class="text-indigo-400 font-bold">4</span>
-          </label>
-          <input type="range" id="input-num-tecnicos" min="2" max="8" value="4" oninput="document.getElementById('label-num-tecnicos').innerText = this.value" class="w-full accent-indigo-500 cursor-pointer">
-        </div>
-
-        <div>
-          <label class="block font-semibold text-slate-300 mb-1.5 flex justify-between">
-            <span>Cantidad de Órdenes (OTs):</span>
-            <span id="label-num-ordenes" class="text-sky-400 font-bold">15</span>
-          </label>
-          <input type="range" id="input-num-ordenes" min="5" max="40" value="15" oninput="document.getElementById('label-num-ordenes').innerText = this.value" class="w-full accent-sky-500 cursor-pointer">
+          <label for="input-semilla" class="block font-semibold text-slate-300 mb-1.5">Semilla (opcional)</label>
+          <input type="number" id="input-semilla" min="0" placeholder="Sin semilla: se sortea una nueva" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-white focus:border-sky-500 focus:outline-none">
         </div>
 
         <div class="bg-slate-950 p-3 rounded-lg border border-slate-800 text-[11px] text-slate-400">
           <i class="fa-solid fa-circle-info text-sky-400 mr-1"></i>
-          Se generarán direcciones reales en Santiago, nombres chilenos, horarios de visita y tipos de trabajo aleatorios.
+          Reinicia el backend: los técnicos se mantienen y las OTs se regeneran. Con la misma semilla, el mismo día se repiten las mismas OTs.
         </div>
       </div>
 
@@ -570,9 +575,9 @@
           cargarMetricas(),
           cargarTecnicos(),
           cargarOrdenes(),
-          cargarRutas(),
           cargarConfiguracion()
         ]);
+        mostrarPropuesta([], []);
       } catch (err) {
         console.error("Error cargando datos:", err);
       } finally {
@@ -616,20 +621,13 @@
       }
     }
 
-    async function cargarRutas() {
-      try {
-        const [resRutas, resPendientes] = await Promise.all([
-          fetch(`${API_BASE}/rutas`),
-          fetch(`${API_BASE}/optimizador/pendientes`)
-        ]);
-        currentRutas = await resRutas.json();
-        currentPendientes = resPendientes.ok ? await resPendientes.json() : [];
-        renderizarHojasDeRuta();
-        filtrarOTs();  // re-render de OTs para marcar las no asignadas
-        dibujarMapa();
-      } catch (e) {
-        console.warn("Fallo cargando rutas", e);
-      }
+    // La propuesta vive solo en la respuesta de la optimizacion: el optimizador no guarda hojas de ruta
+    function mostrarPropuesta(rutas, pendientes) {
+      currentRutas = rutas;
+      currentPendientes = pendientes;
+      renderizarHojasDeRuta();
+      filtrarOTs();  // re-render de OTs para marcar las no asignadas
+      dibujarMapa();
     }
 
     // --- Gestion de Configuracion VRP ---
@@ -645,15 +643,17 @@
 
     function poblarFormularioConfiguracion(cfg) {
       const st = cfg.tiempos_servicio_por_tipo || {};
-      document.getElementById('cfg-st-instalacion-simple').value = st.instalacion_simple || 45;
-      document.getElementById('cfg-st-instalacion-corte').value = st.instalacion_con_corte || 90;
-      document.getElementById('cfg-st-mantencion').value = st.mantencion || 40;
-      document.getElementById('cfg-st-retiro').value = st.retiro || 25;
+      document.getElementById('cfg-st-instalacion-simple').value = st.instalacion_simple || 40;
+      document.getElementById('cfg-st-instalacion-corte').value = st.instalacion_con_corte || 40;
+      document.getElementById('cfg-st-mantencion').value = st.mantencion || 30;
+      document.getElementById('cfg-st-retiro').value = st.retiro || 30;
 
       document.getElementById('cfg-inicio-jornada').value = cfg.inicio_jornada_horas || 8;
-      document.getElementById('cfg-fin-jornada').value = cfg.fin_jornada_horas || 18;
-      document.getElementById('cfg-cap-interno').value = cfg.capacidad_max_interno || 12;
-      document.getElementById('cfg-cap-externo').value = cfg.capacidad_max_externo || 8;
+      document.getElementById('cfg-fin-jornada').value = cfg.fin_jornada_horas || 19;
+      document.getElementById('cfg-tolerancia-antes').value = cfg.tolerancia_antes_min ?? 30;
+      document.getElementById('cfg-tolerancia-despues').value = cfg.tolerancia_despues_min ?? 15;
+      document.getElementById('cfg-cap-interno').value = cfg.capacidad_max_interno || 20;
+      document.getElementById('cfg-cap-externo').value = cfg.capacidad_max_externo || 10;
 
       document.getElementById('cfg-sinuosidad').value = cfg.factor_sinuosidad_vial || 1.30;
       document.getElementById('cfg-velocidad').value = cfg.velocidad_promedio_kmh || 30.0;
@@ -674,6 +674,8 @@
         },
         inicio_jornada_horas: parseInt(document.getElementById('cfg-inicio-jornada').value),
         fin_jornada_horas: parseInt(document.getElementById('cfg-fin-jornada').value),
+        tolerancia_antes_min: parseInt(document.getElementById('cfg-tolerancia-antes').value),
+        tolerancia_despues_min: parseInt(document.getElementById('cfg-tolerancia-despues').value),
         capacidad_max_interno: parseInt(document.getElementById('cfg-cap-interno').value),
         capacidad_max_externo: parseInt(document.getElementById('cfg-cap-externo').value),
         factor_sinuosidad_vial: parseFloat(document.getElementById('cfg-sinuosidad').value),
@@ -748,7 +750,7 @@
               <span class="text-[10px] font-bold px-2 py-0.5 rounded-full ${t.tipo === 'interno' ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30'}">
                 ${t.tipo.toUpperCase()}
               </span>
-              <div class="text-[10px] text-slate-500 mt-1">Cap: ${t.cap_max || (t.tipo === 'interno' ? 12 : 8)} OTs</div>
+              <div class="text-[10px] text-slate-500 mt-1">Cap: ${t.cap_max || (t.tipo === 'interno' ? (currentConfig.capacidad_max_interno || 20) : (currentConfig.capacidad_max_externo || 10))} OTs</div>
             </div>
           </div>
         `;
@@ -860,7 +862,7 @@
               </div>
               <div class="text-right">
                 <span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-900 border border-slate-700 text-slate-300">
-                  ${r.hora_salida_base || '--'} ➔ ${r.hora_retorno_base || '--'}
+                  ${r.hora_salida_base || '--'} ➔ ${r.hora_fin_ruta || '--'}
                 </span>
               </div>
             </div>
@@ -1021,7 +1023,7 @@
               </div>
               <div><strong>Técnico:</strong> ${r.nombre} (${r.tipo})</div>
               <div><strong>Comuna Base:</strong> ${r.zona_base || 'Santiago'}</div>
-              <div><strong>Horario de Jornada:</strong> ${r.hora_salida_base || '--'} ➔ ${r.hora_retorno_base || '--'}</div>
+              <div><strong>Horario de Jornada:</strong> ${r.hora_salida_base || '--'} ➔ ${r.hora_fin_ruta || '--'} (fin del último servicio)</div>
               <div><strong>Carga Asignada:</strong> ${r.capacidad_uso || paradasValidas.length + ' OTs'}</div>
             </div>
           `);
@@ -1056,12 +1058,11 @@
           `);
         });
 
-        // Construir secuencia completa de puntos: Base -> Paradas -> Base
+        // Ruta abierta: Base -> Paradas (el tecnico se queda en la ultima OT, no vuelve a la base)
         if (paradasValidas.length > 0) {
           const waypoints = [];
           if (basePt) waypoints.push(basePt);
           paradasValidas.forEach(p => waypoints.push([p.latitud, p.longitud]));
-          if (basePt) waypoints.push(basePt);
 
           if (waypoints.length >= 2) {
             // Trazar línea temporal guía mientras OSRM responde
@@ -1182,9 +1183,9 @@
 
         await Promise.all([
           cargarMetricas(),
-          cargarOrdenes(),
-          cargarRutas()
+          cargarOrdenes()
         ]);
+        mostrarPropuesta(result.rutas || [], result.diagnosticos || []);
 
         cambiarTab('rutas');
         const r = result.resumen;
@@ -1203,25 +1204,24 @@
 
     async function ejecutarRegeneracion() {
       cerrarModalSimulacion();
-      mostrarLoading("Generando nuevos datos y direcciones en Santiago...");
-      
-      const numTec = parseInt(document.getElementById('input-num-tecnicos').value);
-      const numOrd = parseInt(document.getElementById('input-num-ordenes').value);
+      mostrarLoading("Regenerando los datos del backend...");
+
+      const semilla = document.getElementById('input-semilla').value;
 
       try {
-        await fetch(`${API_BASE}/simulacion/regenerar`, {
+        const res = await fetch(`${API_BASE}/simulacion/regenerar`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            num_tecnicos: numTec,
-            num_ordenes: numOrd,
-            dias_disponibilidad: 14
-          })
+          body: JSON.stringify(semilla === '' ? {} : { semilla: parseInt(semilla) })
         });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+        }
 
         await cargarDatosIniciales();
         cambiarTab('ordenes');
-        mostrarToast("Nuevos datos simulados cargados", "fa-dice", "text-indigo-400");
+        mostrarToast("Datos del backend regenerados", "fa-dice", "text-indigo-400");
       } catch (err) {
         alert("Error regenerando datos: " + err);
       } finally {
