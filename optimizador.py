@@ -112,6 +112,10 @@ PARAMETROS: List[Dict[str, Any]] = [
        "Tolerancia despues de la hora acordada",
        "Minutos despues de la hora programada en que todavia se permite iniciar el servicio.", "min", 0, 240,
        fuente=f"{_DISPATCHER}, como propuesta inicial"),
+    _p("separar_ots_misma_hora", True, "bool", "jornada", "negocio", "operacion_cliente",
+       "OTs de la misma hora con tecnicos distintos",
+       "true: dos OTs con la misma hora programada nunca van al mismo tecnico; si no hay otro tecnico que "
+       "alcance, la OT queda sin asignar. false: un tecnico puede tomar ambas si le alcanzan las tolerancias."),
 
     # --- Capacidad ---
     _p("capacidad_max_externo", 10, "int", "capacidad", "negocio", "operacion_cliente", "Maximo de OTs por tecnico externo",
@@ -261,6 +265,8 @@ CAUSAS: Dict[str, Tuple[str, str, str]] = {
                              "Ningun tecnico alcanza a llegar dentro de la ventana horaria y terminar el servicio "
                              "antes del fin de jornada."),
     "CAPACIDAD_AGOTADA": ("capacidad", "CAPACIDAD", "Los tecnicos que podian atenderla completaron su maximo de OTs."),
+    "MISMA_HORA_SIN_TECNICO": ("temporal", "SIMULTANEA",
+                               "Los tecnicos que podian atenderla ya tienen otra OT con la misma hora programada."),
     "SIN_CUPO_EN_RUTAS": ("optimizacion", "OPTIMIZACION",
                           "Individualmente era atendible, pero no cabe en la jornada junto a las demas OTs asignadas."),
 }
@@ -341,6 +347,10 @@ def describir_modelo() -> Dict[str, Any]:
             {"codigo": "R10", "nombre": "Datos validos", "tipo": "dura",
              "descripcion": "Una OT cuya fecha u hora programada no tiene formato reconocible no se rutea: queda "
                             "pendiente con causa DATOS_INVALIDOS."},
+            {"codigo": "R11", "nombre": "OTs simultaneas", "tipo": "dura (si separar_ots_misma_hora)",
+             "descripcion": "Dos OTs con la misma hora programada las atienden tecnicos distintos; si no hay otro "
+                            "tecnico disponible, la OT queda sin asignar.",
+             "parametros": ["separar_ots_misma_hora"]},
         ],
         "restricciones_fuera_de_esta_version": [
             "Habilidades o certificaciones del tecnico segun el tipo de OT.",
@@ -803,6 +813,16 @@ def preparar_modelo_datos(
         else:
             time_windows.append((inicio_v, fin_v))
 
+    # OTs con la misma hora programada: el modelo las reparte entre tecnicos distintos
+    grupos_misma_hora: List[List[int]] = []
+    if cfg.get("separar_ots_misma_hora", True):
+        por_hora: Dict[int, List[int]] = {}
+        for i, ot in enumerate(ordenes):
+            prog = minutos_desde_inicio(ot.get("hora_programada"), inicio_h)
+            if prog is not None and i not in no_ruteables:
+                por_hora.setdefault(prog, []).append(i)
+        grupos_misma_hora = [g for g in por_hora.values() if len(g) > 1]
+
     return {
         "num_vehicles": V,
         "starts": list(range(V)),
@@ -821,6 +841,8 @@ def preparar_modelo_datos(
         # Restriccion sectorial dura: en sectores reservados solo se permiten internos
         "sector_exclusivo": bool(cfg.get("sectores_internos_exclusivos", False)) and bool(sectores_internos),
         "time_windows": time_windows,
+        "horas_programadas": [ot.get("hora_programada") for ot in ordenes],
+        "grupos_misma_hora": grupos_misma_hora,
         "no_ruteables": no_ruteables,
         "precisiones": precisiones,
         "alertas": alertas,
@@ -920,6 +942,11 @@ def construir_modelo(data: Dict[str, Any], cfg: Dict[str, Any], matrices: Dict[s
             for v in no_internos:
                 routing.VehicleVar(index).RemoveValue(v)
 
+    # OTs de la misma hora: tecnicos distintos. Una OT sin asignar tiene vehiculo -1 y queda fuera de la regla.
+    solver = routing.solver()
+    for grupo in data["grupos_misma_hora"]:
+        solver.Add(solver.AllDifferentExcept([routing.VehicleVar(manager.NodeToIndex(V + i)) for i in grupo], -1))
+
     # Capacidad (cantidad de OTs por tecnico)
     cb_demanda = routing.RegisterUnaryTransitVector(data["demands"] + [0])
     routing.AddDimensionWithVehicleCapacity(cb_demanda, 0, data["vehicle_capacities"], True, "Capacity")
@@ -981,7 +1008,7 @@ def resolver_rutas(
 # 4. DIAGNOSTICO DE OTs NO ASIGNADAS
 # =============================================================================
 def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict[str, Any],
-                                 carga: List[int]) -> List[Dict[str, str]]:
+                                 carga: List[int], tecnico_por_ot: List[Optional[int]]) -> List[Dict[str, str]]:
     """Clasifica por que una OT quedo sin asignar. Retorna causas {codigo, categoria, detalle}; la primera es la principal."""
     if idx_orden in data["no_ruteables"]:
         return [data["no_ruteables"][idx_orden]]
@@ -1030,6 +1057,17 @@ def diagnosticar_orden_pendiente(idx_orden: int, data: Dict[str, Any], cfg: Dict
     if not con_cupo:
         return [_causa("CAPACIDAD_AGOTADA",
                        "los tecnicos que alcanzan a atenderla completaron su capacidad maxima de OTs.")]
+
+    # Misma hora: los tecnicos que podian tomarla ya atienden otra OT programada a esa hora
+    grupo = next((g for g in data["grupos_misma_hora"] if idx_orden in g), None)
+    if grupo:
+        ocupados = {tecnico_por_ot[j] for j in grupo if j != idx_orden and tecnico_por_ot[j] is not None}
+        if all(v in ocupados for v in con_cupo):
+            return [_causa(
+                "MISMA_HORA_SIN_TECNICO",
+                f"hay {len(grupo)} OTs programadas a las {data['horas_programadas'][idx_orden]} y los "
+                f"{len(con_cupo)} tecnico(s) que alcanzan a atenderla ya tienen otra de esa hora; no se asignan "
+                f"dos OTs de la misma hora al mismo tecnico.")]
     return [_causa(
         "SIN_CUPO_EN_RUTAS",
         "no cabe en la jornada junto a las demas OTs asignadas (ventanas horarias o tiempos de viaje). "
@@ -1088,6 +1126,7 @@ def construir_resultado(
     rutas: List[Dict[str, Any]] = []
     asignaciones: List[Dict[str, Any]] = []
     carga = [0] * V
+    tecnico_por_ot: List[Optional[int]] = [None] * len(ordenes)
 
     for v, tec in enumerate(tecnicos):
         index = routing.Start(v)
@@ -1126,6 +1165,7 @@ def construir_resultado(
                 "sector": data["orden_sectores_nombre"][i],
             }
             paradas.append(parada)
+            tecnico_por_ot[i] = v
             asignaciones.append({
                 "ot_id": ot["id"],
                 "tecnico_id": tec["id"],
@@ -1162,7 +1202,7 @@ def construir_resultado(
     for i, ot in enumerate(ordenes):
         index = manager.NodeToIndex(V + i)
         if solution.Value(routing.NextVar(index)) == index:
-            causas = diagnosticar_orden_pendiente(i, data, cfg, carga)
+            causas = diagnosticar_orden_pendiente(i, data, cfg, carga, tecnico_por_ot)
             diagnosticos.append({
                 "ot_id": ot["id"],
                 "tipo": ot.get("tipo"),

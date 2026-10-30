@@ -145,6 +145,7 @@ El backend aplica lo válido y reporta los errores sin detener el resto. Para as
 | R8 | Un interno evita mezclar sectores. | blanda |
 | R9 | Una OT puede quedar sin asignar pagando `penalty_drop_node`. | blanda |
 | R10 | Una OT con fecha u hora inválida no se rutea. | dura |
+| R11 | Dos OTs con la misma hora programada van a técnicos distintos; si no hay otro técnico que alcance, la OT queda sin asignar. | dura (si `separar_ots_misma_hora`) |
 
 ### 4. Función objetivo (minimizar, en metros equivalentes)
 
@@ -165,6 +166,7 @@ Si no se envía `tiempo_limite_segundos`, se calcula como OTs × `solver_segundo
 | `HORA_FUERA_DE_JORNADA` | temporal | La hora programada cae fuera de la jornada. |
 | `VENTANA_INALCANZABLE` | temporal | Ningún técnico llega a tiempo y termina antes del fin de jornada. |
 | `CAPACIDAD_AGOTADA` | capacidad | Los técnicos que podían atenderla ya completaron su máximo de OTs. |
+| `MISMA_HORA_SIN_TECNICO` | temporal | Los técnicos que podían atenderla ya tienen otra OT con la misma hora programada (prefijo `SIMULTANEA:`). |
 | `SIN_CUPO_EN_RUTAS` | optimizacion | Sola era atendible, pero no cabe junto a las demás. |
 
 ## Configuración
@@ -174,7 +176,7 @@ Los parámetros vigentes están en `GET /api/optimizador/configuracion`. El cat�
 | Grupo | Parámetros (valor por defecto) |
 |---|---|
 | Tiempos de servicio | `tiempos_servicio_por_tipo` (instalación simple 40, con corte 40, mantención 30, retiro 30 min), `tiempo_servicio_default` (40) |
-| Jornada | `inicio_jornada_horas` (8), `fin_jornada_horas` (19), `tolerancia_antes_min` (30), `tolerancia_despues_min` (15) |
+| Jornada | `inicio_jornada_horas` (8), `fin_jornada_horas` (19), `tolerancia_antes_min` (30), `tolerancia_despues_min` (15), `separar_ots_misma_hora` (true) |
 | Capacidad | `capacidad_max_interno` (20), `capacidad_max_externo` (10) |
 | Sectores | `umbral_ots_sector_interno` (10), `sectores_internos_exclusivos` (false), `costo_por_ot_externo` (0), `max_radio_operacional_km` (80) |
 | Red vial | `factor_sinuosidad_vial` (1.30), `velocidad_promedio_kmh` (30) |
